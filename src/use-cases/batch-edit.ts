@@ -2,13 +2,14 @@ import yaml from "js-yaml";
 import type { IFileSystemAdapter } from "../domain/interfaces/file-system-adapter.js";
 import type { IDiffService } from "../domain/interfaces/diff-service.js";
 import type { IMarkdownRepository } from "../domain/interfaces/markdown-repository.js";
-import { BatchLimitExceededError, AmbiguousHeadingTargetError } from "../domain/errors/index.js";
+import { BatchLimitExceededError, AmbiguousHeadingTargetError, InvalidArgumentError, InvalidFrontmatterYamlError } from "../domain/errors/index.js";
 import type { MarkdownPipeline } from "./markdown-pipeline.js";
 import { AstNavigator } from "./ast-navigation.js";
 import { AstPatcher } from "./ast-patcher.js";
 import { FuzzyMatcher } from "./fuzzy-match.js";
 import { FreeformEditor } from "./freeform-editor.js";
 import { DryRunEditor } from "./dry-run-edit.js";
+import { parseFrontmatterPayload } from "./frontmatter.js";
 
 const MAX_OPERATIONS = 50;
 
@@ -71,6 +72,44 @@ export class BatchEditService {
     this.dryRunEditor = new DryRunEditor(fsAdapter, diffService);
   }
 
+  /**
+   * Validates that an operation is well-formed BEFORE any file I/O occurs.
+   *
+   * Structural problems (missing required field, invalid JSON payload) reject
+   * the whole batch request up front, so a malformed operation can never
+   * silently write to disk. Runtime problems (file missing, search string not
+   * found) are handled per-operation with `stoppedAtIndex`.
+   *
+   * `content` is required for every operation EXCEPT `delete`. An empty string
+   * is a legitimate value (e.g. removing a block via string_replace).
+   */
+  private static assertValidOperation(op: EditOperation): void {
+    if (typeof op.path !== "string" || op.path.length === 0) {
+      throw new InvalidArgumentError("path");
+    }
+    if (op.operation === "delete") {
+      return;
+    }
+    if (typeof op.content !== "string") {
+      throw new InvalidArgumentError("content");
+    }
+    if (op.operation === "string_replace") {
+      if (typeof op.searchText !== "string" || op.searchText.length === 0) {
+        throw new InvalidArgumentError("searchText");
+      }
+    } else if (op.operation === "line_replace") {
+      if (
+        typeof op.startLine !== "number"
+        || typeof op.endLine !== "number"
+      ) {
+        throw new InvalidArgumentError("startLine/endLine");
+      }
+    } else if (op.operation === "frontmatter_set") {
+      // Throws InvalidFrontmatterPayloadError when content is not valid JSON.
+      parseFrontmatterPayload(op.content);
+    }
+  }
+
   async execute(request: BatchEditRequest): Promise<BatchEditResponse> {
     const { operations, dryRun } = request;
 
@@ -85,6 +124,13 @@ export class BatchEditService {
         totalSucceeded: 0,
         totalFailed: 0,
       };
+    }
+
+    // Reject the whole request (no I/O) if any operation is structurally
+    // malformed — e.g. a string_replace missing `content` must never write
+    // the literal string "undefined" to disk.
+    for (const op of operations) {
+      BatchEditService.assertValidOperation(op);
     }
 
     const results: BatchEditResult[] = [];
@@ -171,12 +217,17 @@ export class BatchEditService {
 
     // ── Frontmatter ──────────────────────────────────────────────
     if (op.operation === "frontmatter_set") {
-      const data = JSON.parse(op.content) as Record<string, unknown>;
+      const data = parseFrontmatterPayload(op.content);
       const tree = this.pipeline.parse(source);
       const yamlNode = tree.children.find((n) => n.type === "yaml");
 
       if (yamlNode && yamlNode.type === "yaml") {
-        const existing = yaml.load(yamlNode.value);
+        let existing: unknown;
+        try {
+          existing = yaml.load(yamlNode.value);
+        } catch (err) {
+          throw new InvalidFrontmatterYamlError(op.path, err);
+        }
         const merged = Object.assign(
           {},
           typeof existing === "object" && existing !== null ? existing : {},

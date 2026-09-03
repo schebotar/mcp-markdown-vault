@@ -1236,3 +1236,91 @@ describe("MCP Server — structured edit response fields", () => {
     expect(schema?.properties).toHaveProperty("returnContent");
   });
 });
+
+// ── edit tool: batch required-content validation ──────────────────
+
+describe("edit tool — batch required-content validation", () => {
+  it("rejects string_replace without content and does not corrupt the file", async () => {
+    const original = await fs.readFile(path.join(tmpDir, "hello.md"), "utf-8");
+    const result = await client.callTool({
+      name: "edit",
+      arguments: {
+        operations: [
+          { path: "hello.md", operation: "string_replace", searchText: "Welcome to the vault." },
+        ],
+      },
+    });
+    expect(result.isError).toBe(true);
+    const content = result.content as Array<{ type: string; text: string }>;
+    const parsed = JSON.parse(content[0]!.text) as { error?: string; message?: string };
+    expect(parsed.error).toBe("INVALID_ARGUMENT");
+    expect(parsed.message).toContain("content");
+
+    const after = await fs.readFile(path.join(tmpDir, "hello.md"), "utf-8");
+    expect(after).toBe(original);
+    expect(after).not.toContain("undefined");
+  });
+});
+
+// ── view tool: frontmatter YAML errors ────────────────────────────
+
+describe("view tool — frontmatter YAML errors", () => {
+  it("frontmatter_get surfaces parse details instead of 'Internal error occurred'", async () => {
+    await fs.writeFile(
+      path.join(tmpDir, "broken.md"),
+      "---\ntags: [mcp, guide\nstatus: draft\n---\n\n# Broken\n\nBody.\n",
+    );
+    const result = await client.callTool({
+      name: "view",
+      arguments: { action: "frontmatter_get", path: "broken.md" },
+    });
+    expect(result.isError).toBe(true);
+    const content = result.content as Array<{ type: string; text: string }>;
+    const text = content[0]!.text;
+    expect(text).not.toContain("Internal error occurred");
+    const parsed = JSON.parse(text) as { error?: string; message?: string };
+    expect(parsed.error).toBe("INVALID_FRONTMATTER_YAML");
+    expect(parsed.message).toContain("broken.md");
+    // js-yaml reports the position as (line:column), e.g. "(2:1)".
+    expect(parsed.message!).toMatch(/\(\d+:\d+\)/);
+  });
+});
+
+// ── view tool: directory paths give a clear error with hints ─────
+
+describe("view tool — directory paths give a clear error with hints", () => {
+  it("search with a directory path explains path must be a file", async () => {
+    const result = await client.callTool({
+      name: "view",
+      arguments: { action: "search", path: "daily", query: "MCP" },
+    });
+    expect(result.isError).toBe(true);
+    const text = (result.content as Array<{ type: string; text: string }>)[0]!.text;
+    const parsed = JSON.parse(text) as { error?: string; message?: string };
+    expect(parsed.error).toBe("PATH_IS_DIRECTORY");
+    expect(parsed.message).toContain("global_search");
+  });
+
+  it("outline with a directory path points to the directory parameter", async () => {
+    const result = await client.callTool({
+      name: "view",
+      arguments: { action: "outline", path: "daily" },
+    });
+    expect(result.isError).toBe(true);
+    const text = (result.content as Array<{ type: string; text: string }>)[0]!.text;
+    const parsed = JSON.parse(text) as { error?: string; message?: string };
+    expect(parsed.error).toBe("PATH_IS_DIRECTORY");
+    expect(parsed.message).toContain("directory parameter");
+  });
+
+  it("read with a directory path is rejected with PATH_IS_DIRECTORY", async () => {
+    const result = await client.callTool({
+      name: "view",
+      arguments: { action: "read", path: "daily" },
+    });
+    expect(result.isError).toBe(true);
+    const text = (result.content as Array<{ type: string; text: string }>)[0]!.text;
+    const parsed = JSON.parse(text) as { error?: string; message?: string };
+    expect(parsed.error).toBe("PATH_IS_DIRECTORY");
+  });
+});

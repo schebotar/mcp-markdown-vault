@@ -70,6 +70,13 @@ describe("FreeformEditor", () => {
         DomainError,
       );
     });
+
+    it("throws instead of writing 'undefined' when content is missing", () => {
+      const missing = undefined as unknown as string;
+      expect(() => FreeformEditor.lineReplace(SAMPLE, 3, 3, missing)).toThrow(
+        DomainError,
+      );
+    });
   });
 
   describe("stringReplace", () => {
@@ -115,6 +122,19 @@ describe("FreeformEditor", () => {
         "$200.00 (EUR)",
       );
       expect(result).toBe("value is $200.00 (EUR)");
+    });
+
+    it("allows empty-string content (removes the matched block)", () => {
+      const source = "foo bar foo baz";
+      const result = FreeformEditor.stringReplace(source, "foo", "");
+      expect(result).toBe(" bar foo baz");
+    });
+
+    it("throws instead of writing 'undefined' when content is missing", () => {
+      const missing = undefined as unknown as string;
+      expect(() =>
+        FreeformEditor.stringReplace("foo bar", "foo", missing),
+      ).toThrow(DomainError);
     });
   });
 });

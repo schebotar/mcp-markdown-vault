@@ -7,7 +7,7 @@ import { MarkdownFileRepository } from "../infrastructure/markdown-file-reposito
 import { UnifiedDiffService } from "../infrastructure/diff-service.js";
 import { MarkdownPipeline } from "./markdown-pipeline.js";
 import { BatchEditService, type EditOperation } from "./batch-edit.js";
-import { BatchLimitExceededError, AmbiguousHeadingTargetError } from "../domain/errors/index.js";
+import { BatchLimitExceededError, AmbiguousHeadingTargetError, InvalidArgumentError, InvalidFrontmatterPayloadError } from "../domain/errors/index.js";
 
 let tmpDir: string;
 let service: BatchEditService;
@@ -276,5 +276,72 @@ describe("BatchEditService — changed field", () => {
     });
     expect(result.results[0]!.status).toBe("success");
     expect(result.results[0]!.changed).toBe(true);
+  });
+});
+
+describe("BatchEditService — pre-flight validation (required fields)", () => {
+  it("rejects string_replace without content and leaves the file unchanged", async () => {
+    const original = await fs.readFile(path.join(tmpDir, "note2.md"), "utf-8");
+    const operations = [
+      { path: "note2.md", operation: "string_replace" as const, searchText: "Some text here." },
+    ];
+    await expect(service.execute({ operations })).rejects.toThrow(InvalidArgumentError);
+    const after = await fs.readFile(path.join(tmpDir, "note2.md"), "utf-8");
+    expect(after).toBe(original);
+    expect(after).not.toContain("undefined");
+  });
+
+  it("rejects append without content", async () => {
+    const operations = [{ path: "note1.md", operation: "append" as const }];
+    await expect(service.execute({ operations })).rejects.toThrow(InvalidArgumentError);
+  });
+
+  it("rejects string_replace without searchText", async () => {
+    const operations = [{ path: "note2.md", operation: "string_replace" as const, content: "x" }];
+    await expect(service.execute({ operations })).rejects.toThrow(InvalidArgumentError);
+  });
+
+  it("rejects line_replace without startLine/endLine", async () => {
+    const operations = [{ path: "note1.md", operation: "line_replace" as const, content: "x" }];
+    await expect(service.execute({ operations })).rejects.toThrow(InvalidArgumentError);
+  });
+
+  it("rejects frontmatter_set with invalid JSON", async () => {
+    const operations = [{ path: "note1.md", operation: "frontmatter_set" as const, content: "not json {{" }];
+    await expect(service.execute({ operations })).rejects.toThrow(InvalidFrontmatterPayloadError);
+  });
+
+  it("rejects the whole mixed batch so nothing is partially applied", async () => {
+    const original = await fs.readFile(path.join(tmpDir, "note1.md"), "utf-8");
+    const operations = [
+      { path: "note1.md", operation: "append" as const, content: "Would have been applied." },
+      // Missing content → structural error must reject the entire request.
+      { path: "note2.md", operation: "string_replace" as const, searchText: "Some text here." },
+    ];
+    await expect(service.execute({ operations })).rejects.toThrow(InvalidArgumentError);
+    const after = await fs.readFile(path.join(tmpDir, "note1.md"), "utf-8");
+    expect(after).toBe(original);
+  });
+
+  it("allows empty-string content (legitimate deletion)", async () => {
+    const result = await service.execute({
+      operations: [
+        { path: "note2.md", operation: "string_replace" as const, searchText: "Some text here.", content: "" },
+      ],
+    });
+    expect(result.totalSucceeded).toBe(1);
+    const after = await fs.readFile(path.join(tmpDir, "note2.md"), "utf-8");
+    expect(after).not.toContain("Some text here.");
+  });
+
+  it("allows delete without content", async () => {
+    const result = await service.execute({
+      operations: [
+        { path: "note1.md", operation: "delete" as const, heading: "Section A", headingDepth: 2 },
+      ],
+    });
+    expect(result.totalSucceeded).toBe(1);
+    const after = await fs.readFile(path.join(tmpDir, "note1.md"), "utf-8");
+    expect(after).not.toContain("Section A");
   });
 });

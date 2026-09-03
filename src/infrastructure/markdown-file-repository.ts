@@ -3,6 +3,7 @@ import yaml from "js-yaml";
 import type { IMarkdownRepository } from "../domain/interfaces/markdown-repository.js";
 import type { IFileSystemAdapter } from "../domain/interfaces/file-system-adapter.js";
 import type { MarkdownPipeline } from "../use-cases/markdown-pipeline.js";
+import { InvalidFrontmatterYamlError } from "../domain/errors/index.js";
 
 /**
  * Reads/writes markdown notes via the file system and remark AST pipeline.
@@ -27,7 +28,12 @@ export class MarkdownFileRepository implements IMarkdownRepository {
     if (!yamlNode || yamlNode.type !== "yaml") {
       return {};
     }
-    const data = yaml.load(yamlNode.value);
+    let data: unknown;
+    try {
+      data = yaml.load(yamlNode.value);
+    } catch (err) {
+      throw new InvalidFrontmatterYamlError(filePath, err);
+    }
     if (typeof data !== "object" || data === null) {
       return {};
     }
@@ -43,7 +49,12 @@ export class MarkdownFileRepository implements IMarkdownRepository {
     const yamlNode = tree.children.find((n) => n.type === "yaml");
 
     if (yamlNode && yamlNode.type === "yaml") {
-      const existing = yaml.load(yamlNode.value);
+      let existing: unknown;
+      try {
+        existing = yaml.load(yamlNode.value);
+      } catch (err) {
+        throw new InvalidFrontmatterYamlError(filePath, err);
+      }
       const merged = Object.assign(
         {},
         typeof existing === "object" && existing !== null ? existing : {},

@@ -27,7 +27,7 @@ import { VaultIndexer } from "../use-cases/vault-indexer.js";
 import { MarkdownFileRepository } from "../infrastructure/markdown-file-repository.js";
 import { RegexTemplateEngine } from "../infrastructure/regex-template-engine.js";
 import { UnifiedDiffService } from "../infrastructure/diff-service.js";
-import { DomainError, InvalidArgumentError, OutlineLimitExceededError, AmbiguousHeadingTargetError } from "../domain/errors/index.js";
+import { DomainError, InvalidArgumentError, OutlineLimitExceededError, AmbiguousHeadingTargetError, InvalidFrontmatterYamlError, PathIsDirectoryError } from "../domain/errors/index.js";
 import { OverviewManager } from "../use-cases/overview-manager.js";
 import { VaultStatsComposer } from "../use-cases/vault-stats.js";
 import { VaultOverviewResourceComposer } from "../use-cases/vault-resource-overview.js";
@@ -329,7 +329,12 @@ export function createMcpServer(deps: McpDependencies): McpServer {
         const parsed = parseFrontmatterPayload(content);
 
         if (yamlNode && yamlNode.type === "yaml") {
-          const existing = yaml.load(yamlNode.value);
+          let existing: unknown;
+          try {
+            existing = yaml.load(yamlNode.value);
+          } catch (err) {
+            throw new InvalidFrontmatterYamlError(notePath, err);
+          }
           const mergedFrontmatter = Object.assign(
             {},
             typeof existing === "object" && existing !== null ? existing : {},
@@ -432,12 +437,31 @@ export function createMcpServer(deps: McpDependencies): McpServer {
     },
   }, async ({ action, path: notePath, query, maxChunks, heading, headingDepth, directory, items }) => {
     return wrapTool(deps.workflow, "view", takePrimingContext(), async () => {
+      // Reads a note, rethrowing PathIsDirectoryError with an action-specific
+      // hint so callers learn that `path` must point to a file, not a folder.
+      const readNoteForView = async (
+        filePath: string,
+        hint: string,
+      ): Promise<string> => {
+        try {
+          return await deps.fsAdapter.readNote(filePath);
+        } catch (err) {
+          if (err instanceof PathIsDirectoryError) {
+            throw new PathIsDirectoryError(filePath, hint);
+          }
+          throw err;
+        }
+      };
+
       const actionResult = await (async () => {
         switch (action) {
         case "search": {
           if (!notePath) throw new InvalidArgumentError("path");
           if (!query) throw new InvalidArgumentError("query");
-          const source = await deps.fsAdapter.readNote(notePath);
+          const source = await readNoteForView(
+            notePath,
+            "path must point to a note file (.md), not a directory. For directory-wide search use global_search or semantic_search with the directory parameter.",
+          );
           const fragments = retriever.retrieve(source, query, {
             maxChunks: maxChunks ?? 5,
           });
@@ -490,7 +514,10 @@ export function createMcpServer(deps: McpDependencies): McpServer {
             return results;
           }
           if (!notePath) throw new InvalidArgumentError("path");
-          const source = await deps.fsAdapter.readNote(notePath);
+          const source = await readNoteForView(
+            notePath,
+            "path must point to a note file (.md), not a directory. To outline a whole folder, pass it via the directory parameter (or use vault list / system overview).",
+          );
           const tree = pipeline.parse(source);
           return AstNavigator.findAllHeadings(tree);
         }
@@ -506,7 +533,10 @@ export function createMcpServer(deps: McpDependencies): McpServer {
             });
             return result;
           }
-          const content = await deps.fsAdapter.readNote(notePath);
+          const content = await readNoteForView(
+            notePath,
+            "path must point to a note file (.md), not a directory.",
+          );
           return content;
         }
         case "frontmatter_get": {

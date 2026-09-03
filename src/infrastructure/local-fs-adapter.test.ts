@@ -9,6 +9,7 @@ import {
   PathTraversalError,
   VaultNotFoundError,
   SymlinkEscapeError,
+  PathIsDirectoryError,
 } from "../domain/errors/index.js";
 
 let vaultDir: string;
@@ -100,6 +101,17 @@ describe("readNote", () => {
     await expect(adapter.readNote("nope.md")).rejects.toThrow(
       NoteNotFoundError,
     );
+  });
+
+  it("throws PathIsDirectoryError when path points to a directory", async () => {
+    await fs.mkdir(path.join(vaultDir, "subdir"), { recursive: true });
+    await fs.writeFile(path.join(vaultDir, "subdir/note.md"), "# Nested\n");
+    await expect(adapter.readNote("subdir")).rejects.toThrow(
+      PathIsDirectoryError,
+    );
+    // A real file inside the directory still reads fine.
+    const content = await adapter.readNote("subdir/note.md");
+    expect(content).toContain("Nested");
   });
 
   it("rejects path traversal", async () => {

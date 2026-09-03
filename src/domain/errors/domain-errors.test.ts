@@ -15,6 +15,8 @@ import {
   AbsolutePathError,
   SymlinkEscapeError,
   InvalidArgumentError,
+  PathIsDirectoryError,
+  InvalidFrontmatterYamlError,
 } from "./index.js";
 
 describe("DomainError (base class)", () => {
@@ -172,6 +174,35 @@ describe("InvalidArgumentError", () => {
     expect(err.code).toBe("INVALID_ARGUMENT");
     expect(err.message).toContain("path");
     expect(err.name).toBe("InvalidArgumentError");
+    expect(err).toBeInstanceOf(DomainError);
+  });
+});
+
+describe("PathIsDirectoryError", () => {
+  it("has code PATH_IS_DIRECTORY and includes the path", () => {
+    const err = new PathIsDirectoryError("folder/");
+    expect(err.code).toBe("PATH_IS_DIRECTORY");
+    expect(err.message).toContain("folder/");
+    expect(err.name).toBe("PathIsDirectoryError");
+    expect(err).toBeInstanceOf(DomainError);
+  });
+
+  it("appends a hint when provided", () => {
+    const err = new PathIsDirectoryError("folder/", "path must point to a file");
+    expect(err.message).toContain("path must point to a file");
+  });
+});
+
+describe("InvalidFrontmatterYamlError", () => {
+  it("has code INVALID_FRONTMATTER_YAML and includes file path and parse detail", () => {
+    const err = new InvalidFrontmatterYamlError(
+      "note.md",
+      new Error("unexpected end of the stream within a flow collection at line 2, column 9"),
+    );
+    expect(err.code).toBe("INVALID_FRONTMATTER_YAML");
+    expect(err.message).toContain("note.md");
+    expect(err.message).toContain("line 2, column 9");
+    expect(err.name).toBe("InvalidFrontmatterYamlError");
     expect(err).toBeInstanceOf(DomainError);
   });
 });

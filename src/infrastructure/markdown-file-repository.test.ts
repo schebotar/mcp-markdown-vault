@@ -5,7 +5,7 @@ import os from "node:os";
 import { LocalFileSystemAdapter } from "./local-fs-adapter.js";
 import { MarkdownPipeline } from "../use-cases/markdown-pipeline.js";
 import { MarkdownFileRepository } from "./markdown-file-repository.js";
-import { NoteNotFoundError } from "../domain/errors/index.js";
+import { NoteNotFoundError, InvalidFrontmatterYamlError } from "../domain/errors/index.js";
 
 let vaultDir: string;
 let repo: MarkdownFileRepository;
@@ -74,6 +74,26 @@ describe("readFrontmatter", () => {
     await expect(repo.readFrontmatter("nope.md")).rejects.toThrow(
       NoteNotFoundError,
     );
+  });
+
+  it("throws InvalidFrontmatterYamlError with line info for malformed YAML", async () => {
+    await fs.writeFile(
+      path.join(vaultDir, "broken.md"),
+      "---\ntags: [mcp, guide\nstatus: draft\n---\n\n# Broken\n\nBody.\n",
+    );
+
+    let caught: unknown;
+    try {
+      await repo.readFrontmatter("broken.md");
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(InvalidFrontmatterYamlError);
+    const err = caught as InvalidFrontmatterYamlError;
+    expect(err.code).toBe("INVALID_FRONTMATTER_YAML");
+    expect(err.message).toContain("broken.md");
+    // js-yaml reports the position as (line:column), e.g. "(2:1)".
+    expect(err.message).toMatch(/\(\d+:\d+\)/);
   });
 });
 

@@ -16,6 +16,11 @@ export class FreeformEditor {
     endLine: number,
     content: string,
   ): string {
+    if (typeof content !== "string") {
+      throw new FreeformEditError(
+        `Replacement content must be a string, got: ${String(content)}`,
+      );
+    }
     const lines = source.split("\n");
 
     if (startLine < 1) {
@@ -49,6 +54,11 @@ export class FreeformEditor {
     replace: string,
     replaceAll?: boolean,
   ): string {
+    if (typeof replace !== "string") {
+      throw new FreeformEditError(
+        `Replacement content must be a string, got: ${String(replace)}`,
+      );
+    }
     if (!source.includes(search)) {
       throw new FreeformEditError(`Search string not found: "${search}"`);
     }

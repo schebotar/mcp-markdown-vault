@@ -10,6 +10,7 @@ import {
   NoteNotFoundError,
   NoteAlreadyExistsError,
   SymlinkEscapeError,
+  PathIsDirectoryError,
 } from "../domain/errors/index.js";
 import { SafePath } from "../domain/value-objects/index.js";
 
@@ -107,11 +108,42 @@ export class LocalFileSystemAdapter implements IFileSystemAdapter {
   async readNote(notePath: string): Promise<string> {
     const safePath = SafePath.create(this.vaultRoot, notePath);
     await this.assertContained(safePath.absolute);
+
+    // SafePath.create auto-appends ".md". When the caller passes a directory
+    // (e.g. "daily" or "Встречи/"), that file path won't exist — detect the
+    // directory so we can raise PATH_IS_DIRECTORY instead of a misleading
+    // NOTE_NOT_FOUND.
+    let fileStat: Awaited<ReturnType<typeof fs.stat>> | undefined;
     try {
-      return await fs.readFile(safePath.absolute, "utf-8");
+      fileStat = await fs.stat(safePath.absolute);
     } catch {
-      throw new NoteNotFoundError(notePath);
+      // File missing — checked below.
     }
+
+    if (fileStat !== undefined) {
+      if (fileStat.isDirectory()) {
+        throw new PathIsDirectoryError(notePath);
+      }
+      return await fs.readFile(safePath.absolute, "utf-8");
+    }
+
+    // File does not exist — check whether the raw path names an existing
+    // directory (e.g. "subdir" or "subdir/").
+    const rawDir = notePath.replace(/[/\\]+$/, "");
+    if (rawDir.length > 0 && !rawDir.endsWith(".md")) {
+      const dirSafe = SafePath.createDirectory(this.vaultRoot, rawDir);
+      try {
+        const dirStat = await fs.stat(dirSafe.absolute);
+        if (dirStat.isDirectory()) {
+          throw new PathIsDirectoryError(notePath);
+        }
+      } catch (err) {
+        if (err instanceof PathIsDirectoryError) throw err;
+        // Not an existing directory — fall through to NOTE_NOT_FOUND.
+      }
+    }
+
+    throw new NoteNotFoundError(notePath);
   }
 
   async writeNote(

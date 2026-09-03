@@ -50,6 +50,17 @@ export class InvalidNotePathError extends DomainError {
   }
 }
 
+/** Thrown when a vault-relative path points to a directory instead of a note file. */
+export class PathIsDirectoryError extends DomainError {
+  constructor(path: string, hint?: string) {
+    super(
+      "PATH_IS_DIRECTORY",
+      `Path is a directory, not a note: ${path}${hint ? ` — ${hint}` : ""}`,
+    );
+    this.name = "PathIsDirectoryError";
+  }
+}
+
 // ── AST / Parsing errors ───────────────────────────────────────────
 
 export class AstPatchError extends DomainError {
@@ -110,6 +121,20 @@ export class InvalidFrontmatterPayloadError extends DomainError {
       `Invalid frontmatter payload: ${detail}`,
     );
     this.name = "InvalidFrontmatterPayloadError";
+  }
+}
+
+/** Thrown when existing YAML frontmatter in a note cannot be parsed. */
+export class InvalidFrontmatterYamlError extends DomainError {
+  constructor(filePath: string, cause?: unknown) {
+    super(
+      "INVALID_FRONTMATTER_YAML",
+      `Invalid YAML in frontmatter of ${filePath}: ${
+        cause instanceof Error ? cause.message : String(cause)
+      }`,
+      cause instanceof Error ? cause : undefined,
+    );
+    this.name = "InvalidFrontmatterYamlError";
   }
 }
 
