@@ -9,6 +9,8 @@ import { HintsEngine, type ToolName } from "../use-cases/hints.js";
 import { MarkdownPipeline } from "../use-cases/markdown-pipeline.js";
 import { AstNavigator } from "../use-cases/ast-navigation.js";
 import { AstPatcher } from "../use-cases/ast-patcher.js";
+import type { PatchOperation } from "../use-cases/ast-patcher.js";
+import { TextPatcher } from "../use-cases/text-patcher.js";
 import { FragmentRetriever } from "../use-cases/fragment-retrieval.js";
 import { FuzzyMatcher } from "../use-cases/fuzzy-match.js";
 import { VaultSearcher } from "../use-cases/vault-search.js";
@@ -411,8 +413,21 @@ export function createMcpServer(deps: McpDependencies): McpServer {
         target = "document";
       }
 
-      AstPatcher.apply(tree, { type: operation, target, content: content ?? "", replaceMode }, pipeline);
-      const newContent = pipeline.stringify(tree);
+      const patchRequest: PatchOperation = {
+        type: operation,
+        target,
+        content: content ?? "",
+        replaceMode,
+      };
+      // Heading/block edits preserve the rest of the file byte-for-byte;
+      // document targets (and missing offsets) fall back to AST re-serialization.
+      let newContent = target === "document"
+        ? undefined
+        : TextPatcher.apply(source, tree, patchRequest, pipeline);
+      if (newContent === undefined) {
+        AstPatcher.apply(tree, patchRequest, pipeline);
+        newContent = pipeline.stringify(tree);
+      }
 
       const result = await dryRunEditor.execute({
         path: notePath,

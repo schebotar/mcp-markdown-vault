@@ -344,4 +344,16 @@ describe("BatchEditService — pre-flight validation (required fields)", () => {
     const after = await fs.readFile(path.join(tmpDir, "note1.md"), "utf-8");
     expect(after).not.toContain("Section A");
   });
+
+  it("rejects line_replace when expectLine does not match, without writing", async () => {
+    const original = await fs.readFile(path.join(tmpDir, "note1.md"), "utf-8");
+    const result = await service.execute({
+      operations: [
+        { path: "note1.md", operation: "line_replace" as const, startLine: 5, endLine: 5, content: "X", expectLine: "Nope" },
+      ],
+    });
+    expect(result.results[0]!.status).toBe("error");
+    expect(result.results[0]!.error).toContain("does not match");
+    expect(await fs.readFile(path.join(tmpDir, "note1.md"), "utf-8")).toBe(original);
+  });
 });

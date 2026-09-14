@@ -6,6 +6,8 @@ import { BatchLimitExceededError, AmbiguousHeadingTargetError, InvalidArgumentEr
 import type { MarkdownPipeline } from "./markdown-pipeline.js";
 import { AstNavigator } from "./ast-navigation.js";
 import { AstPatcher } from "./ast-patcher.js";
+import type { PatchOperation } from "./ast-patcher.js";
+import { TextPatcher } from "./text-patcher.js";
 import { FuzzyMatcher } from "./fuzzy-match.js";
 import { FreeformEditor } from "./freeform-editor.js";
 import { DryRunEditor } from "./dry-run-edit.js";
@@ -278,8 +280,20 @@ export class BatchEditService {
       target = "document";
     }
 
-    AstPatcher.apply(tree, { type: op.operation, target, content: op.content, replaceMode: op.replaceMode }, this.pipeline);
-    const newContent = this.pipeline.stringify(tree);
+    const patchRequest: PatchOperation = {
+      type: op.operation,
+      target,
+      content: op.content ?? "",
+      replaceMode: op.replaceMode,
+    };
+    // Heading/block edits preserve the rest of the file byte-for-byte.
+    let newContent = target === "document"
+      ? undefined
+      : TextPatcher.apply(source, tree, patchRequest, this.pipeline);
+    if (newContent === undefined) {
+      AstPatcher.apply(tree, patchRequest, this.pipeline);
+      newContent = this.pipeline.stringify(tree);
+    }
 
     return withChanged(newContent, op.operation);
   }

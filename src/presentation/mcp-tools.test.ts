@@ -1647,3 +1647,56 @@ describe("edit tool — dryRun determinism (D4)", () => {
     expect(dryParsed.result.diff).toBe(expected);
   });
 });
+
+// ── byte-preserving heading edits (C1) ────────────────────────────
+
+describe("edit tool — byte-preserving heading edits (C1)", () => {
+  it("append under a heading leaves other sections byte-for-byte intact", async () => {
+    const other = "- dash item one\n- dash item two\n\ncall send_mail() now\n\n| a | b |\n| - | - |\n";
+    const source = `# Doc\n\n## Target\n\nOld target body.\n\n## Other\n\n${other}`;
+    await fs.writeFile(path.join(tmpDir, "bp.md"), source);
+
+    const result = await client.callTool({
+      name: "edit",
+      arguments: {
+        path: "bp.md",
+        operation: "append",
+        heading: "Target",
+        headingDepth: 2,
+        content: "Added line.",
+      },
+    });
+    expect(result.isError).toBeFalsy();
+
+    const after = await fs.readFile(path.join(tmpDir, "bp.md"), "utf-8");
+    expect(after).toContain("Added line.");
+    // The untouched section keeps its exact formatting.
+    expect(after.slice(after.indexOf("## Other"))).toBe(`## Other\n\n${other}`);
+    expect(after).not.toContain("* dash item");
+    expect(after).not.toContain("send\\_mail");
+    expect(after).toContain("| a | b |");
+  });
+
+  it("replace preserves the heading and other sections", async () => {
+    const source = "# Doc\n\n## Target\n\nOld body.\n\n## Other\n\nkeep_this_underscore\n";
+    await fs.writeFile(path.join(tmpDir, "bp2.md"), source);
+
+    const result = await client.callTool({
+      name: "edit",
+      arguments: {
+        path: "bp2.md",
+        operation: "replace",
+        heading: "Target",
+        headingDepth: 2,
+        content: "New body.",
+      },
+    });
+    expect(result.isError).toBeFalsy();
+
+    const after = await fs.readFile(path.join(tmpDir, "bp2.md"), "utf-8");
+    expect(after).toContain("## Target");
+    expect(after).toContain("New body.");
+    expect(after).not.toContain("Old body.");
+    expect(after).toContain("keep_this_underscore");
+  });
+});
