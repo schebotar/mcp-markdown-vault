@@ -4,6 +4,7 @@ import path from "path";
 import os from "os";
 import { createMcpServer, type McpDependencies } from "./mcp-tools.js";
 import { LocalFileSystemAdapter } from "../infrastructure/local-fs-adapter.js";
+import { UnifiedDiffService } from "../infrastructure/diff-service.js";
 import { InMemoryVectorStore } from "../infrastructure/vector-store/in-memory-vector-store.js";
 import { WorkflowStateMachine } from "../use-cases/workflow-state.js";
 import { VaultIndexer } from "../use-cases/vault-indexer.js";
@@ -1301,16 +1302,18 @@ describe("view tool — directory paths give a clear error with hints", () => {
     expect(parsed.message).toContain("global_search");
   });
 
-  it("outline with a directory path points to the directory parameter", async () => {
+  it("outline with a directory path returns the directory outline with a warning (B2)", async () => {
     const result = await client.callTool({
       name: "view",
       arguments: { action: "outline", path: "daily" },
     });
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBeFalsy();
     const text = (result.content as Array<{ type: string; text: string }>)[0]!.text;
-    const parsed = JSON.parse(text) as { error?: string; message?: string };
-    expect(parsed.error).toBe("PATH_IS_DIRECTORY");
-    expect(parsed.message).toContain("directory parameter");
+    const parsed = JSON.parse(text) as {
+      result: { directory: string; warnings: string[]; files: unknown[] };
+    };
+    expect(parsed.result.directory).toBe("daily");
+    expect(parsed.result.warnings).toHaveLength(1);
   });
 
   it("read with a directory path is rejected with PATH_IS_DIRECTORY", async () => {
@@ -1471,5 +1474,176 @@ describe("edit tool — single-call required content (D1)", () => {
     };
     expect(parsed.error).toBe("INVALID_ARGUMENT");
     expect(await fs.readFile(path.join(tmpDir, "hello.md"), "utf-8")).toBe(original);
+  });
+});
+
+// ── edit tool: expectLine guard (A3/D3) ───────────────────────────
+
+describe("edit tool — line_replace expectLine guard (A3)", () => {
+  it("succeeds when expectLine matches", async () => {
+    await fs.writeFile(path.join(tmpDir, "expect.md"), "# T\n\nAlpha line.\nBeta line.\n");
+
+    const result = await client.callTool({
+      name: "edit",
+      arguments: {
+        path: "expect.md",
+        operation: "line_replace",
+        startLine: 3,
+        endLine: 3,
+        content: "Replaced.",
+        expectLine: "Alpha line",
+      },
+    });
+
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      result: { changed?: boolean };
+    };
+    expect(parsed.result.changed).toBe(true);
+    expect(await fs.readFile(path.join(tmpDir, "expect.md"), "utf-8")).toContain("Replaced.");
+  });
+
+  it("fails with the actual line content when expectLine drifts", async () => {
+    await fs.writeFile(path.join(tmpDir, "expect2.md"), "# T\n\nAlpha line.\nBeta line.\n");
+
+    const result = await client.callTool({
+      name: "edit",
+      arguments: {
+        path: "expect2.md",
+        operation: "line_replace",
+        startLine: 3,
+        endLine: 3,
+        content: "Replaced.",
+        expectLine: "Totally different",
+      },
+    });
+
+    expect(result.isError).toBe(true);
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      error?: string;
+      message?: string;
+    };
+    expect(parsed.error).toBe("FREEFORM_EDIT_FAILED");
+    expect(parsed.message).toContain("Line 3");
+    expect(parsed.message).toContain("Alpha line.");
+    expect(await fs.readFile(path.join(tmpDir, "expect2.md"), "utf-8")).toContain("Alpha line.");
+  });
+});
+
+// ── view.outline: directory path fallback (B2) ────────────────────
+
+describe("view.outline — directory path fallback (B2)", () => {
+  it("outlines a directory passed via path with a warning instead of failing", async () => {
+    await fs.mkdir(path.join(tmpDir, "outdir"), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, "outdir/a.md"), "# A\n");
+    await fs.writeFile(path.join(tmpDir, "outdir/b.md"), "# B\n");
+
+    const result = await client.callTool({
+      name: "view",
+      arguments: { action: "outline", path: "outdir" },
+    });
+
+    expect(result.isError).toBeFalsy();
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      result: { directory: string; warnings: string[]; files: Array<{ path: string }> };
+    };
+    expect(parsed.result.directory).toBe("outdir");
+    expect(parsed.result.warnings).toHaveLength(1);
+    expect(parsed.result.files).toHaveLength(2);
+  });
+});
+
+// ── view path errors carry hints (B3) ─────────────────────────────
+
+describe("view tool — path error hints (B3)", () => {
+  it("NOTE_NOT_FOUND includes nearest-path suggestions", async () => {
+    const result = await client.callTool({
+      name: "view",
+      arguments: { action: "read", path: "helo.md" },
+    });
+    expect(result.isError).toBe(true);
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      error?: string;
+      hint?: string;
+    };
+    expect(parsed.error).toBe("NOTE_NOT_FOUND");
+    expect(parsed.hint).toBeDefined();
+    expect(parsed.hint).toContain("hello.md");
+  });
+
+  it("PATH_IS_DIRECTORY includes a hint", async () => {
+    const result = await client.callTool({
+      name: "view",
+      arguments: { action: "read", path: "daily" },
+    });
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      error?: string;
+      hint?: string;
+    };
+    expect(parsed.error).toBe("PATH_IS_DIRECTORY");
+    expect(parsed.hint).toBeDefined();
+  });
+});
+
+// ── frontmatter_set is byte-preserving (C1) ───────────────────────
+
+describe("edit tool — byte-preserving frontmatter_set (C1)", () => {
+  it("leaves the body (dash bullets, underscores) untouched", async () => {
+    const body = "# Title\n\n- item one\n- item two\n\ncall send_mail() now\n";
+    await fs.writeFile(path.join(tmpDir, "fm.md"), `---\ntitle: T\n---\n\n${body}`);
+
+    const result = await client.callTool({
+      name: "edit",
+      arguments: { path: "fm.md", operation: "frontmatter_set", content: '{"status":"draft"}' },
+    });
+
+    expect(result.isError).toBeFalsy();
+    const after = await fs.readFile(path.join(tmpDir, "fm.md"), "utf-8");
+    expect(after).toContain("status: draft");
+    expect(after).toContain(body);
+    expect(after).not.toContain("* item one");
+    expect(after).not.toContain("send\\_mail");
+  });
+});
+
+// ── dryRun determinism (D4) ───────────────────────────────────────
+
+describe("edit tool — dryRun determinism (D4)", () => {
+  it("dryRun preview matches the diff of the actually applied change", async () => {
+    const original = "# T\n\nSome text here.\n";
+    await fs.writeFile(path.join(tmpDir, "dry.md"), original);
+
+    const dryResult = await client.callTool({
+      name: "edit",
+      arguments: {
+        path: "dry.md",
+        operation: "string_replace",
+        searchText: "Some text here.",
+        content: "Replaced text.",
+        dryRun: true,
+      },
+    });
+    const dryParsed = JSON.parse(
+      (dryResult.content as Array<{ type: string; text: string }>)[0]!.text,
+    ) as { result: { diff?: string } };
+    expect(dryParsed.result.diff).toBeDefined();
+    // dryRun must not write.
+    expect(await fs.readFile(path.join(tmpDir, "dry.md"), "utf-8")).toBe(original);
+
+    const realResult = await client.callTool({
+      name: "edit",
+      arguments: {
+        path: "dry.md",
+        operation: "string_replace",
+        searchText: "Some text here.",
+        content: "Replaced text.",
+      },
+    });
+    expect(realResult.isError).toBeFalsy();
+    const applied = await fs.readFile(path.join(tmpDir, "dry.md"), "utf-8");
+    expect(applied).toContain("Replaced text.");
+
+    // Determinism: the preview equals the diff of the real before/after.
+    const expected = new UnifiedDiffService().generateDiff(original, applied, "dry.md");
+    expect(dryParsed.result.diff).toBe(expected);
   });
 });

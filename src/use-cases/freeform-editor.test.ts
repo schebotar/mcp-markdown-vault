@@ -79,6 +79,33 @@ describe("FreeformEditor", () => {
     });
   });
 
+  describe("assertLine", () => {
+    it("passes when the line contains expectLine (trimmed)", () => {
+      expect(() =>
+        FreeformEditor.assertLine(SAMPLE, 3, "First paragraph"),
+      ).not.toThrow();
+    });
+
+    it("throws with the actual line content on mismatch", () => {
+      let caught: unknown;
+      try {
+        FreeformEditor.assertLine(SAMPLE, 3, "Nonexistent text");
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(DomainError);
+      const message = (caught as Error).message;
+      expect(message).toContain("Line 3");
+      expect(message).toContain("First paragraph.");
+    });
+
+    it("throws for an out-of-range line", () => {
+      expect(() => FreeformEditor.assertLine(SAMPLE, 99, "x")).toThrow(
+        DomainError,
+      );
+    });
+  });
+
   describe("stringReplace", () => {
     it("replaces first occurrence by default", () => {
       const source = "foo bar foo baz";

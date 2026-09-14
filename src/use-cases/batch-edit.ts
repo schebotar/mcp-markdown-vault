@@ -12,6 +12,7 @@ import { DryRunEditor } from "./dry-run-edit.js";
 import { parseFrontmatterPayload } from "./frontmatter.js";
 import { fingerprintNote } from "./file-fingerprint.js";
 import { buildStringNotFoundMessage, logStringReplaceFailure } from "./string-not-found.js";
+import { extractFrontmatterRaw, replaceFrontmatterBlock } from "./frontmatter-surgery.js";
 
 const MAX_OPERATIONS = 50;
 
@@ -25,6 +26,7 @@ export interface EditOperation {
   blockId?: string | undefined;
   startLine?: number | undefined;
   endLine?: number | undefined;
+  expectLine?: string | undefined;
   searchText?: string | undefined;
   replaceAll?: boolean | undefined;
   replaceMode?: "body" | "section" | undefined;
@@ -200,6 +202,9 @@ export class BatchEditService {
       if (op.startLine === undefined || op.endLine === undefined) {
         throw new Error("startLine and endLine are required for line_replace");
       }
+      if (op.expectLine !== undefined) {
+        FreeformEditor.assertLine(source, op.startLine, op.expectLine);
+      }
       const newContent = FreeformEditor.lineReplace(
         source, op.startLine, op.endLine, op.content,
       );
@@ -228,30 +233,20 @@ export class BatchEditService {
     // ── Frontmatter ──────────────────────────────────────────────
     if (op.operation === "frontmatter_set") {
       const data = parseFrontmatterPayload(op.content);
-      const tree = this.pipeline.parse(source);
-      const yamlNode = tree.children.find((n) => n.type === "yaml");
-
-      if (yamlNode && yamlNode.type === "yaml") {
-        let existing: unknown;
+      const rawFrontmatter = extractFrontmatterRaw(source);
+      let existing: Record<string, unknown> = {};
+      if (rawFrontmatter !== undefined) {
         try {
-          existing = yaml.load(yamlNode.value);
+          const loaded = yaml.load(rawFrontmatter);
+          if (typeof loaded === "object" && loaded !== null) {
+            existing = loaded as Record<string, unknown>;
+          }
         } catch (err) {
           throw new InvalidFrontmatterYamlError(op.path, err);
         }
-        const merged = Object.assign(
-          {},
-          typeof existing === "object" && existing !== null ? existing : {},
-          data,
-        );
-        yamlNode.value = yaml.dump(merged).trimEnd();
-      } else {
-        tree.children.unshift({
-          type: "yaml",
-          value: yaml.dump(data).trimEnd(),
-        });
       }
-
-      const newContent = this.pipeline.stringify(tree);
+      const merged = Object.assign({}, existing, data);
+      const newContent = replaceFrontmatterBlock(source, yaml.dump(merged).trimEnd());
       return withChanged(newContent, "frontmatter_set");
     }
 

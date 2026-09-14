@@ -45,6 +45,31 @@ export class FreeformEditor {
   }
 
   /**
+   * Assert that a 1-based line contains `expectLine` (after trimming both).
+   * Guards `line_replace` against file drift: if the file shifted between the
+   * read and the edit, the caller gets the actual line content instead of
+   * silently replacing the wrong line.
+   */
+  static assertLine(
+    source: string,
+    lineNumber: number,
+    expectLine: string,
+  ): void {
+    const lines = source.split("\n");
+    if (lineNumber < 1 || lineNumber > lines.length) {
+      throw new FreeformEditError(
+        `Line ${lineNumber} is out of range (file has ${lines.length} lines)`,
+      );
+    }
+    const actual = lines[lineNumber - 1] ?? "";
+    if (!actual.trim().includes(expectLine.trim())) {
+      throw new FreeformEditError(
+        `Line ${lineNumber} does not match expectLine. Actual: ${JSON.stringify(actual)}`,
+      );
+    }
+  }
+
+  /**
    * Find and replace a literal string. Uses exact string matching
    * (no regex) to avoid brittle patterns.
    */

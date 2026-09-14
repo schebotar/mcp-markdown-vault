@@ -6,9 +6,13 @@
 export class DomainError extends Error {
   public readonly code: string;
 
-  constructor(code: string, message: string, cause?: Error) {
+  /** Optional actionable next step, surfaced in the tool error response. */
+  public readonly hint: string | undefined;
+
+  constructor(code: string, message: string, cause?: Error, hint?: string) {
     super(message, { cause });
     this.code = code;
+    this.hint = hint;
     this.name = "DomainError";
   }
 }
@@ -30,8 +34,8 @@ export class PathTraversalError extends DomainError {
 }
 
 export class NoteNotFoundError extends DomainError {
-  constructor(notePath: string) {
-    super("NOTE_NOT_FOUND", `Note not found: ${notePath}`);
+  constructor(notePath: string, hint?: string) {
+    super("NOTE_NOT_FOUND", `Note not found: ${notePath}`, undefined, hint);
     this.name = "NoteNotFoundError";
   }
 }
@@ -56,6 +60,8 @@ export class PathIsDirectoryError extends DomainError {
     super(
       "PATH_IS_DIRECTORY",
       `Path is a directory, not a note: ${path}${hint ? ` — ${hint}` : ""}`,
+      undefined,
+      hint,
     );
     this.name = "PathIsDirectoryError";
   }
@@ -193,8 +199,13 @@ export class SymlinkEscapeError extends DomainError {
 // ── Argument errors ───────────────────────────────────────────────
 
 export class InvalidArgumentError extends DomainError {
-  constructor(argumentName: string) {
-    super("INVALID_ARGUMENT", `Required argument missing: ${argumentName}`);
+  constructor(argumentName: string, hint?: string) {
+    super(
+      "INVALID_ARGUMENT",
+      `Required argument missing: ${argumentName}`,
+      undefined,
+      hint,
+    );
     this.name = "InvalidArgumentError";
   }
 }

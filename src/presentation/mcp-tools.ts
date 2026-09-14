@@ -27,12 +27,13 @@ import { VaultIndexer } from "../use-cases/vault-indexer.js";
 import { MarkdownFileRepository } from "../infrastructure/markdown-file-repository.js";
 import { RegexTemplateEngine } from "../infrastructure/regex-template-engine.js";
 import { UnifiedDiffService } from "../infrastructure/diff-service.js";
-import { DomainError, InvalidArgumentError, OutlineLimitExceededError, AmbiguousHeadingTargetError, InvalidFrontmatterYamlError, PathIsDirectoryError, FreeformEditError } from "../domain/errors/index.js";
+import { DomainError, InvalidArgumentError, OutlineLimitExceededError, AmbiguousHeadingTargetError, InvalidFrontmatterYamlError, PathIsDirectoryError, FreeformEditError, NoteNotFoundError } from "../domain/errors/index.js";
 import { OverviewManager } from "../use-cases/overview-manager.js";
 import { VaultStatsComposer } from "../use-cases/vault-stats.js";
 import { VaultOverviewResourceComposer } from "../use-cases/vault-resource-overview.js";
 import { fingerprintNote } from "../use-cases/file-fingerprint.js";
 import { buildStringNotFoundMessage, logStringReplaceFailure } from "../use-cases/string-not-found.js";
+import { extractFrontmatterRaw, replaceFrontmatterBlock } from "../use-cases/frontmatter-surgery.js";
 
 export interface McpDependencies {
   fsAdapter: IFileSystemAdapter;
@@ -195,6 +196,7 @@ export function createMcpServer(deps: McpDependencies): McpServer {
       endLine: z.number().optional(),
       searchText: z.string().optional(),
       replaceAll: z.boolean().optional(),
+      expectLine: z.string().optional().describe("For line_replace: verify that startLine contains this text (after trim) before replacing; on mismatch the error reports the actual line content."),
       dryRun: z.boolean().optional().describe("If true, returns a preview of changes as a unified diff without saving to disk."),
       returnContent: z.enum(["none", "section", "file"]).optional().describe("When set to 'section' or 'file', the response includes the modified content (max 8KB). Defaults to 'none'."),
       operations: z.array(z.object({
@@ -209,9 +211,10 @@ export function createMcpServer(deps: McpDependencies): McpServer {
         endLine: z.number().optional(),
         searchText: z.string().optional(),
         replaceAll: z.boolean().optional(),
+        expectLine: z.string().optional(),
       })).optional().describe("For batch mode: array of edit operations (max 50). Executed sequentially, stops on first error."),
     },
-  }, async ({ path: notePath, operation, content, heading, headingDepth, replaceMode, blockId, startLine, endLine, searchText, replaceAll, dryRun, returnContent, operations }) => {
+  }, async ({ path: notePath, operation, content, heading, headingDepth, replaceMode, blockId, startLine, endLine, searchText, replaceAll, expectLine, dryRun, returnContent, operations }) => {
     return wrapTool(deps.workflow, "edit", takePrimingContext(), async () => {
       // Helper: update indexes after file write
       // Backlinks synchronously (required for consistency), vectors in background
@@ -296,6 +299,9 @@ export function createMcpServer(deps: McpDependencies): McpServer {
           throw new InvalidArgumentError("startLine/endLine");
         }
         if (content === undefined) throw new InvalidArgumentError("content");
+        if (expectLine !== undefined) {
+          FreeformEditor.assertLine(source, startLine, expectLine);
+        }
         const newContent = FreeformEditor.lineReplace(source, startLine, endLine, content);
         const result = await dryRunEditor.execute({
           path: notePath,
@@ -334,31 +340,28 @@ export function createMcpServer(deps: McpDependencies): McpServer {
       // ── Frontmatter operation ──────────────────────────────────
       if (operation === "frontmatter_set") {
         if (content === undefined) throw new InvalidArgumentError("content");
-        const tree = pipeline.parse(source);
-        const yamlNode = tree.children.find((node) => node.type === "yaml");
         const parsed = parseFrontmatterPayload(content);
 
-        if (yamlNode && yamlNode.type === "yaml") {
-          let existing: unknown;
+        // Byte-preserving: only the frontmatter block is rewritten; the body
+        // is never passed through remark-stringify.
+        const rawFrontmatter = extractFrontmatterRaw(source);
+        let existing: Record<string, unknown> = {};
+        if (rawFrontmatter !== undefined) {
           try {
-            existing = yaml.load(yamlNode.value);
+            const loaded = yaml.load(rawFrontmatter);
+            if (typeof loaded === "object" && loaded !== null) {
+              existing = loaded as Record<string, unknown>;
+            }
           } catch (err) {
             throw new InvalidFrontmatterYamlError(notePath, err);
           }
-          const mergedFrontmatter = Object.assign(
-            {},
-            typeof existing === "object" && existing !== null ? existing : {},
-            parsed,
-          );
-          yamlNode.value = yaml.dump(mergedFrontmatter).trimEnd();
-        } else {
-          tree.children.unshift({
-            type: "yaml",
-            value: yaml.dump(parsed).trimEnd(),
-          });
         }
+        const mergedFrontmatter = Object.assign({}, existing, parsed);
+        const newContent = replaceFrontmatterBlock(
+          source,
+          yaml.dump(mergedFrontmatter).trimEnd(),
+        );
 
-        const newContent = pipeline.stringify(tree);
         const result = await dryRunEditor.execute({
           path: notePath,
           oldContent: source,
@@ -451,6 +454,20 @@ export function createMcpServer(deps: McpDependencies): McpServer {
     return wrapTool(deps.workflow, "view", takePrimingContext(), async () => {
       // Reads a note, rethrowing PathIsDirectoryError with an action-specific
       // hint so callers learn that `path` must point to a file, not a folder.
+      // NOTE_NOT_FOUND gains up to two nearest-path suggestions (B3).
+      const nearestPathHint = async (requested: string): Promise<string> => {
+        try {
+          const notes = await deps.fsAdapter.listNotes();
+          const matches = FuzzyMatcher.allMatches(requested, notes, 0.5).slice(0, 2);
+          if (matches.length > 0) {
+            return `did you mean: ${matches.map((m) => JSON.stringify(m.match)).join(", ")}? (use vault list to browse all notes)`;
+          }
+        } catch {
+          // fall through to the generic hint
+        }
+        return "use vault list to browse available notes";
+      };
+
       const readNoteForView = async (
         filePath: string,
         hint: string,
@@ -460,6 +477,9 @@ export function createMcpServer(deps: McpDependencies): McpServer {
         } catch (err) {
           if (err instanceof PathIsDirectoryError) {
             throw new PathIsDirectoryError(filePath, hint);
+          }
+          if (err instanceof NoteNotFoundError) {
+            throw new NoteNotFoundError(filePath, await nearestPathHint(filePath));
           }
           throw err;
         }
@@ -538,12 +558,31 @@ export function createMcpServer(deps: McpDependencies): McpServer {
             return results;
           }
           if (!notePath) throw new InvalidArgumentError("path");
-          const source = await readNoteForView(
-            notePath,
-            "path must point to a note file (.md), not a directory. To outline a whole folder, pass it via the directory parameter (or use vault list / system overview).",
-          );
-          const tree = pipeline.parse(source);
-          return AstNavigator.findAllHeadings(tree);
+          try {
+            const source = await deps.fsAdapter.readNote(notePath);
+            const tree = pipeline.parse(source);
+            return AstNavigator.findAllHeadings(tree);
+          } catch (err) {
+            if (!(err instanceof PathIsDirectoryError)) throw err;
+            // B2: `path` pointing at a directory is not an error — outline it
+            // and record a warning instead of failing.
+            const files = await deps.fsAdapter.listNotes(notePath);
+            if (files.length === 0) {
+              throw new InvalidArgumentError("path (directory has no markdown files)");
+            }
+            if (files.length > 50) {
+              throw new OutlineLimitExceededError("Directory outline limit: max 50 files");
+            }
+            const results = await Promise.all(files.map(async (filePath) => {
+              const source = await deps.fsAdapter.readNote(filePath);
+              return { path: filePath, headings: AstNavigator.findAllHeadings(pipeline.parse(source)) };
+            }));
+            return {
+              directory: notePath,
+              warnings: [`path ${JSON.stringify(notePath)} is a directory; returning its outline (use the directory parameter to scope explicitly)`],
+              files: results,
+            };
+          }
         }
         case "read": {
           if (!notePath) throw new InvalidArgumentError("path");
@@ -832,6 +871,9 @@ async function wrapTool<T>(
         error: err.code,
         message: err.message,
       };
+      if (err.hint !== undefined) {
+        errorResponse["hint"] = err.hint;
+      }
       if (err instanceof AmbiguousHeadingTargetError) {
         errorResponse["candidates"] = err.candidates;
       }
