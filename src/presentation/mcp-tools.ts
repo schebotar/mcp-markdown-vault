@@ -27,10 +27,12 @@ import { VaultIndexer } from "../use-cases/vault-indexer.js";
 import { MarkdownFileRepository } from "../infrastructure/markdown-file-repository.js";
 import { RegexTemplateEngine } from "../infrastructure/regex-template-engine.js";
 import { UnifiedDiffService } from "../infrastructure/diff-service.js";
-import { DomainError, InvalidArgumentError, OutlineLimitExceededError, AmbiguousHeadingTargetError, InvalidFrontmatterYamlError, PathIsDirectoryError } from "../domain/errors/index.js";
+import { DomainError, InvalidArgumentError, OutlineLimitExceededError, AmbiguousHeadingTargetError, InvalidFrontmatterYamlError, PathIsDirectoryError, FreeformEditError } from "../domain/errors/index.js";
 import { OverviewManager } from "../use-cases/overview-manager.js";
 import { VaultStatsComposer } from "../use-cases/vault-stats.js";
 import { VaultOverviewResourceComposer } from "../use-cases/vault-resource-overview.js";
+import { fingerprintNote } from "../use-cases/file-fingerprint.js";
+import { buildStringNotFoundMessage, logStringReplaceFailure } from "../use-cases/string-not-found.js";
 
 export interface McpDependencies {
   fsAdapter: IFileSystemAdapter;
@@ -310,6 +312,14 @@ export function createMcpServer(deps: McpDependencies): McpServer {
           throw new InvalidArgumentError("searchText");
         }
         if (content === undefined) throw new InvalidArgumentError("content");
+        if (!source.includes(searchText)) {
+          logStringReplaceFailure(searchText, source);
+          const fingerprint = await fingerprintNote(deps.fsAdapter, notePath, source)
+            .catch(() => undefined);
+          throw new FreeformEditError(
+            buildStringNotFoundMessage(searchText, source, fingerprint),
+          );
+        }
         const newContent = FreeformEditor.stringReplace(source, searchText, content, replaceAll ?? false);
         const result = await dryRunEditor.execute({
           path: notePath,
@@ -420,22 +430,24 @@ export function createMcpServer(deps: McpDependencies): McpServer {
   server.registerTool("view", {
     title: "View",
     description:
-      `Read and search markdown notes. Vault scope: ${vaultScope}.\nActions: search (heading-aware fragment retrieval with TF-IDF + proximity), semantic_search (vector + lexical hybrid for conceptual queries), global_search (cross-vault exact-match grep), outline (file or directory structure tree), read (full file or single section by heading), frontmatter_get (parse YAML frontmatter), bulk_read (read multiple files/headings in one call), backlinks (find all notes linking to a given path).`,
+      `Read and search markdown notes. Vault scope: ${vaultScope}.\nActions: search (heading-aware fragment retrieval with TF-IDF + proximity; file-scoped when path is given, otherwise vault- or directory-wide), semantic_search (vector + lexical hybrid for conceptual queries), global_search (cross-vault exact-match grep), outline (file or directory structure tree), read (full file or single section by heading; supports lineNumbers and stat), frontmatter_get (parse YAML frontmatter), bulk_read (read multiple files/headings in one call), backlinks (find all notes linking to a given path).`,
     inputSchema: {
       action: z.enum(["search", "global_search", "semantic_search", "outline", "read", "frontmatter_get", "bulk_read", "backlinks"]),
-      path: z.string().optional(),
+      path: z.string().optional().describe("Note path (a .md file). Required for read/outline/frontmatter_get/backlinks; optional for search — omit it to search the whole vault or the given directory."),
       query: z.string().optional(),
       maxChunks: z.number().optional(),
       heading: z.string().optional(),
       headingDepth: z.number().optional(),
-      directory: z.string().optional().describe("Filter search results to a specific directory or path prefix. Example: 'projects/active/'"),
+      lineNumbers: z.boolean().optional().describe("For read: prefix each returned line with its 1-based number ('N: content')."),
+      stat: z.boolean().optional().describe("For read: include a file fingerprint (size, mtime, sha256[:12]) in the response."),
+      directory: z.string().optional().describe("Scope search/outline to a directory prefix. Used by search/global_search/semantic_search/outline. Example: 'projects/active/'"),
       items: z.array(z.object({
         path: z.string(),
         heading: z.string().optional(),
         headingDepth: z.number().optional(),
       })).optional().describe("For bulk_read: array of files to read, each with optional heading to extract."),
     },
-  }, async ({ action, path: notePath, query, maxChunks, heading, headingDepth, directory, items }) => {
+  }, async ({ action, path: notePath, query, maxChunks, heading, headingDepth, lineNumbers, stat, directory, items }) => {
     return wrapTool(deps.workflow, "view", takePrimingContext(), async () => {
       // Reads a note, rethrowing PathIsDirectoryError with an action-specific
       // hint so callers learn that `path` must point to a file, not a folder.
@@ -456,20 +468,32 @@ export function createMcpServer(deps: McpDependencies): McpServer {
       const actionResult = await (async () => {
         switch (action) {
         case "search": {
-          if (!notePath) throw new InvalidArgumentError("path");
           if (!query) throw new InvalidArgumentError("query");
-          const source = await readNoteForView(
-            notePath,
-            "path must point to a note file (.md), not a directory. For directory-wide search use global_search or semantic_search with the directory parameter.",
-          );
-          const fragments = retriever.retrieve(source, query, {
-            maxChunks: maxChunks ?? 5,
+          if (notePath) {
+            const source = await readNoteForView(
+              notePath,
+              "path must point to a note file (.md), not a directory. Omit path to search the whole vault, or use directory to scope it (see global_search/semantic_search).",
+            );
+            const fragments = retriever.retrieve(source, query, {
+              maxChunks: maxChunks ?? 5,
+            });
+            return fragments.map((f) => ({
+              headingPath: f.chunk.headingPath,
+              text: f.chunk.text,
+              score: Math.round(f.score * 1000) / 1000,
+              wordCount: f.chunk.wordCount,
+            }));
+          }
+          const results = await vaultSearcher.search(query, {
+            maxResults: maxChunks ?? 20,
+            directory,
           });
-          return fragments.map((f) => ({
-            headingPath: f.chunk.headingPath,
-            text: f.chunk.text,
-            score: Math.round(f.score * 1000) / 1000,
-            wordCount: f.chunk.wordCount,
+          return results.map((r) => ({
+            filePath: r.filePath,
+            headingPath: r.headingPath,
+            text: r.text,
+            score: Math.round(r.score * 1000) / 1000,
+            wordCount: r.wordCount,
           }));
         }
         case "global_search": {
@@ -523,6 +547,11 @@ export function createMcpServer(deps: McpDependencies): McpServer {
         }
         case "read": {
           if (!notePath) throw new InvalidArgumentError("path");
+          const wantLineNumbers = lineNumbers ?? false;
+          const wantStat = stat ?? false;
+          const withLineNumbers = (text: string): string =>
+            text.split("\n").map((line, index) => `${index + 1}: ${line}`).join("\n");
+
           if (heading) {
             const repo = new MarkdownFileRepository(deps.fsAdapter, pipeline);
             const useCase = new ReadByHeadingUseCase(repo, pipeline);
@@ -531,13 +560,32 @@ export function createMcpServer(deps: McpDependencies): McpServer {
               heading,
               headingDepth,
             });
-            return result;
+            if (!wantLineNumbers && !wantStat) return result;
+            const enriched: Record<string, unknown> = { ...result };
+            if (result.found && wantLineNumbers) {
+              enriched["content"] = withLineNumbers(result.content);
+              enriched["warnings"] = [
+                "line numbers are relative to the returned section; use a full-file read (without heading) for line_replace",
+              ];
+            }
+            if (wantStat) {
+              enriched["stat"] = await fingerprintNote(deps.fsAdapter, notePath);
+            }
+            return enriched;
           }
+
           const content = await readNoteForView(
             notePath,
             "path must point to a note file (.md), not a directory.",
           );
-          return content;
+          if (!wantLineNumbers && !wantStat) return content;
+          return {
+            path: notePath,
+            content: wantLineNumbers ? withLineNumbers(content) : content,
+            ...(wantStat
+              ? { stat: await fingerprintNote(deps.fsAdapter, notePath, content) }
+              : {}),
+          };
         }
         case "frontmatter_get": {
           if (!notePath) throw new InvalidArgumentError("path");

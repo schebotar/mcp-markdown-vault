@@ -2,7 +2,7 @@ import yaml from "js-yaml";
 import type { IFileSystemAdapter } from "../domain/interfaces/file-system-adapter.js";
 import type { IDiffService } from "../domain/interfaces/diff-service.js";
 import type { IMarkdownRepository } from "../domain/interfaces/markdown-repository.js";
-import { BatchLimitExceededError, AmbiguousHeadingTargetError, InvalidArgumentError, InvalidFrontmatterYamlError } from "../domain/errors/index.js";
+import { BatchLimitExceededError, AmbiguousHeadingTargetError, InvalidArgumentError, InvalidFrontmatterYamlError, FreeformEditError } from "../domain/errors/index.js";
 import type { MarkdownPipeline } from "./markdown-pipeline.js";
 import { AstNavigator } from "./ast-navigation.js";
 import { AstPatcher } from "./ast-patcher.js";
@@ -10,6 +10,8 @@ import { FuzzyMatcher } from "./fuzzy-match.js";
 import { FreeformEditor } from "./freeform-editor.js";
 import { DryRunEditor } from "./dry-run-edit.js";
 import { parseFrontmatterPayload } from "./frontmatter.js";
+import { fingerprintNote } from "./file-fingerprint.js";
+import { buildStringNotFoundMessage, logStringReplaceFailure } from "./string-not-found.js";
 
 const MAX_OPERATIONS = 50;
 
@@ -208,6 +210,14 @@ export class BatchEditService {
     if (op.operation === "string_replace") {
       if (!op.searchText) {
         throw new Error("searchText is required for string_replace");
+      }
+      if (!source.includes(op.searchText)) {
+        logStringReplaceFailure(op.searchText, source);
+        const fingerprint = await fingerprintNote(this.fsAdapter, op.path, source)
+          .catch(() => undefined);
+        throw new FreeformEditError(
+          buildStringNotFoundMessage(op.searchText, source, fingerprint),
+        );
       }
       const newContent = FreeformEditor.stringReplace(
         source, op.searchText, op.content, op.replaceAll ?? false,

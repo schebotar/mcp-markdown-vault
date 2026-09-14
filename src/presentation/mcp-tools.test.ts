@@ -1324,3 +1324,152 @@ describe("view tool — directory paths give a clear error with hints", () => {
     expect(parsed.error).toBe("PATH_IS_DIRECTORY");
   });
 });
+
+// ── edit tool: string_replace diagnostics (A1) ────────────────────
+
+describe("edit tool — string_replace diagnostics (A1)", () => {
+  it("reports nearest line + line_replace hint, leaves the file intact, then succeeds", async () => {
+    const body = "# Title\n\nAlpha line one.\nTarget line with [[Agent/x]] and stuff.\nOmega line.\n";
+    await fs.writeFile(path.join(tmpDir, "diag.md"), body);
+
+    const result = await client.callTool({
+      name: "edit",
+      arguments: {
+        path: "diag.md",
+        operation: "string_replace",
+        searchText: "Target line with [[Agent/x]] and other stuff",
+        content: "replacement",
+      },
+    });
+
+    expect(result.isError).toBe(true);
+    const text = (result.content as Array<{ type: string; text: string }>)[0]!.text;
+    const parsed = JSON.parse(text) as { error?: string; message?: string };
+    expect(parsed.error).toBe("FREEFORM_EDIT_FAILED");
+    expect(parsed.message).toContain("nearest line 4");
+    expect(parsed.message).toContain("line_replace startLine=4 endLine=4");
+    expect(parsed.message).toContain("sha256=");
+
+    // File must not be modified by the failed attempt.
+    expect(await fs.readFile(path.join(tmpDir, "diag.md"), "utf-8")).toBe(body);
+
+    // Second call: the suggested line_replace works.
+    const lineResult = await client.callTool({
+      name: "edit",
+      arguments: {
+        path: "diag.md",
+        operation: "line_replace",
+        startLine: 4,
+        endLine: 4,
+        content: "Replaced line.",
+      },
+    });
+    const lineParsed = JSON.parse(
+      (lineResult.content as Array<{ type: string; text: string }>)[0]!.text,
+    ) as { result: { changed?: boolean } };
+    expect(lineParsed.result.changed).toBe(true);
+    expect(await fs.readFile(path.join(tmpDir, "diag.md"), "utf-8")).toContain("Replaced line.");
+  });
+});
+
+// ── view.read: line numbers and stat (A2) ─────────────────────────
+
+describe("view.read — line numbers and stat (A2)", () => {
+  it("prefixes line numbers when lineNumbers=true", async () => {
+    const result = await client.callTool({
+      name: "view",
+      arguments: { action: "read", path: "hello.md", lineNumbers: true },
+    });
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      result: { path: string; content: string };
+    };
+    expect(parsed.result.path).toBe("hello.md");
+    expect(parsed.result.content).toContain("1: ---");
+    expect(parsed.result.content).toContain("5: # Hello World");
+  });
+
+  it("includes a file fingerprint when stat=true", async () => {
+    const result = await client.callTool({
+      name: "view",
+      arguments: { action: "read", path: "hello.md", stat: true },
+    });
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      result: { stat: { sizeBytes: number; mtime: string; sha256: string } };
+    };
+    expect(parsed.result.stat.sha256).toMatch(/^[0-9a-f]{12}$/);
+    expect(typeof parsed.result.stat.sizeBytes).toBe("number");
+    expect(typeof parsed.result.stat.mtime).toBe("string");
+  });
+
+  it("still returns a raw string when no read options are requested", async () => {
+    const result = await client.callTool({
+      name: "view",
+      arguments: { action: "read", path: "hello.md" },
+    });
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text);
+    expect(typeof parsed.result).toBe("string");
+  });
+});
+
+// ── view.search: directory and whole-vault scope (B1) ─────────────
+
+describe("view.search — directory and whole-vault scope (B1)", () => {
+  it("searches the whole vault when path is omitted", async () => {
+    const result = await client.callTool({
+      name: "view",
+      arguments: { action: "search", query: "learned about MCP" },
+    });
+    expect(result.isError).toBeFalsy();
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      result: Array<{ filePath: string }>;
+    };
+    expect(Array.isArray(parsed.result)).toBe(true);
+    expect(parsed.result.some((r) => r.filePath === "daily/2024-01-01.md")).toBe(true);
+  });
+
+  it("scopes search to a directory", async () => {
+    const result = await client.callTool({
+      name: "view",
+      arguments: { action: "search", query: "learned about MCP", directory: "daily" },
+    });
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      result: Array<{ filePath: string }>;
+    };
+    expect(parsed.result.length).toBeGreaterThan(0);
+    expect(parsed.result.every((r) => r.filePath.startsWith("daily/"))).toBe(true);
+  });
+
+  it("still supports file-scoped search when path is given", async () => {
+    const result = await client.callTool({
+      name: "view",
+      arguments: { action: "search", query: "Getting Started", path: "hello.md" },
+    });
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      result: unknown[];
+    };
+    expect(parsed.result.length).toBeGreaterThan(0);
+  });
+
+  it("errors when query is missing even without path", async () => {
+    const result = await client.callTool({ name: "view", arguments: { action: "search" } });
+    expect(result.isError).toBe(true);
+  });
+});
+
+// ── edit tool: single-call required content (D1) ──────────────────
+
+describe("edit tool — single-call required content (D1)", () => {
+  it("rejects a single string_replace without content and does not touch the file", async () => {
+    const original = await fs.readFile(path.join(tmpDir, "hello.md"), "utf-8");
+    const result = await client.callTool({
+      name: "edit",
+      arguments: { path: "hello.md", operation: "string_replace", searchText: "Welcome to the vault." },
+    });
+    expect(result.isError).toBe(true);
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      error?: string;
+    };
+    expect(parsed.error).toBe("INVALID_ARGUMENT");
+    expect(await fs.readFile(path.join(tmpDir, "hello.md"), "utf-8")).toBe(original);
+  });
+});
