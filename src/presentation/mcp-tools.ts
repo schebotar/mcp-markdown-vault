@@ -36,6 +36,10 @@ import { VaultOverviewResourceComposer } from "../use-cases/vault-resource-overv
 import { fingerprintNote } from "../use-cases/file-fingerprint.js";
 import { buildStringNotFoundMessage, logStringReplaceFailure } from "../use-cases/string-not-found.js";
 import { extractFrontmatterRaw, replaceFrontmatterBlock } from "../use-cases/frontmatter-surgery.js";
+import { matchGlob } from "../use-cases/glob.js";
+import { checkContentSanity } from "../use-cases/content-sanity.js";
+import { NormalizeLinksUseCase } from "../use-cases/normalize-links.js";
+import { SelftestUseCase } from "../use-cases/selftest.js";
 
 export interface McpDependencies {
   fsAdapter: IFileSystemAdapter;
@@ -135,7 +139,10 @@ export function createMcpServer(deps: McpDependencies): McpServer {
           await deps.fsAdapter.writeNote(path, content);
           deps.backlinkIndex?.updateFile(path, content);
           deps.indexer?.indexFile(path).catch(() => {/* background */});
-          return `Note created: ${path}`;
+          const warnings = checkContentSanity(content);
+          return warnings.length > 0
+            ? { message: `Note created: ${path}`, warnings }
+            : `Note created: ${path}`;
         }
         case "update": {
           if (!path) throw new InvalidArgumentError("path");
@@ -144,7 +151,10 @@ export function createMcpServer(deps: McpDependencies): McpServer {
           const result = await useCase.execute({ path, content });
           deps.backlinkIndex?.updateFile(path, content);
           deps.indexer?.indexFile(path).catch(() => {/* background */});
-          return result.message;
+          const warnings = checkContentSanity(content);
+          return warnings.length > 0
+            ? { message: result.message, warnings }
+            : result.message;
         }
         case "delete": {
           if (!path) throw new InvalidArgumentError("path");
@@ -185,7 +195,7 @@ export function createMcpServer(deps: McpDependencies): McpServer {
   server.registerTool("edit", {
     title: "Edit",
     description:
-      `Edit notes safely. Vault scope: ${vaultScope}. Supports AST edits by heading/block ID, freeform line/string replacement, frontmatter_set metadata merges, batch operations (max 50), and dryRun=true unified diff previews. Read vault://overview for editing strategy and conventions.\n\nTIPS: Always use dryRun=true before destructive operations (delete, replace). Use bulk_read for reading 2+ files. Use view.outline before heading-specific edits when unsure of heading names. string_replace requires exact literal match including whitespace/newlines.`,
+      `Edit notes safely. Vault scope: ${vaultScope}. Supports AST edits by heading/block ID, freeform line/string replacement, frontmatter_set metadata merges, batch operations (max 50), and dryRun=true unified diff previews. Read vault://overview for editing strategy and conventions.\n\nTIPS: Always use dryRun=true before destructive operations (delete, replace). Use bulk_read for reading 2+ files. Use view.outline before heading-specific edits when unsure of heading names. string_replace requires exact literal match including whitespace/newlines. Write wiki-links unescaped as [[path]] (not \\[[path]]).`,
     inputSchema: {
       path: z.string().optional().describe("Note path (required for single edit)."),
       operation: z.enum(["append", "prepend", "replace", "delete", "line_replace", "string_replace", "frontmatter_set"]).optional().describe("Edit operation (required for single edit). 'delete' removes the full heading section including child headings. 'replace' by default replaces only the body under the heading (heading node preserved). Use replaceMode='section' to replace the heading and all its content."),
@@ -254,6 +264,10 @@ export function createMcpServer(deps: McpDependencies): McpServer {
       if (content === undefined && operation !== "delete") throw new InvalidArgumentError("content");
 
       const source = await deps.fsAdapter.readNote(notePath);
+      const contentWarnings =
+        content !== undefined && operation !== "frontmatter_set" && operation !== "delete"
+          ? checkContentSanity(content)
+          : [];
       const diffService = new UnifiedDiffService();
       const dryRunEditor = new DryRunEditor(deps.fsAdapter, diffService);
 
@@ -274,6 +288,9 @@ export function createMcpServer(deps: McpDependencies): McpServer {
           path: notePath,
           ...(targetResolved !== undefined ? { targetResolved } : {}),
         };
+        if (contentWarnings.length > 0) {
+          enriched.warnings = contentWarnings;
+        }
         const rc = returnContent ?? "none";
         if (rc === "file") {
           const fileContent = dryRun ? newContent : await deps.fsAdapter.readNote(notePath);
@@ -448,11 +465,12 @@ export function createMcpServer(deps: McpDependencies): McpServer {
   server.registerTool("view", {
     title: "View",
     description:
-      `Read and search markdown notes. Vault scope: ${vaultScope}.\nActions: search (heading-aware fragment retrieval with TF-IDF + proximity; file-scoped when path is given, otherwise vault- or directory-wide), semantic_search (vector + lexical hybrid for conceptual queries), global_search (cross-vault exact-match grep), outline (file or directory structure tree), read (full file or single section by heading; supports lineNumbers and stat), frontmatter_get (parse YAML frontmatter), bulk_read (read multiple files/headings in one call), backlinks (find all notes linking to a given path).`,
+      `Read and search markdown notes. Vault scope: ${vaultScope}.\nActions: search (heading-aware fragment retrieval with TF-IDF + proximity; file-scoped when path is given, otherwise vault- or directory-wide), semantic_search (vector + lexical hybrid for conceptual queries), global_search (cross-vault exact-match grep), outline (file or directory structure tree), read (full file or single section by heading; supports lineNumbers and stat), glob (list paths matching a glob pattern), frontmatter_get (parse YAML frontmatter), bulk_read (read multiple files/headings in one call), backlinks (find all notes linking to a given path). Wiki-links are canonical unescaped [[path]]; use system.normalize_links to fix escaped \\[[ forms.`,
     inputSchema: {
-      action: z.enum(["search", "global_search", "semantic_search", "outline", "read", "frontmatter_get", "bulk_read", "backlinks"]),
+      action: z.enum(["search", "global_search", "semantic_search", "outline", "read", "glob", "frontmatter_get", "bulk_read", "backlinks"]),
       path: z.string().optional().describe("Note path (a .md file). Required for read/outline/frontmatter_get/backlinks; optional for search — omit it to search the whole vault or the given directory."),
       query: z.string().optional(),
+      pattern: z.string().optional().describe("For glob: glob pattern over vault-relative paths (supports *, **, ?). Example: 'projects/**/*.md'."),
       maxChunks: z.number().optional(),
       heading: z.string().optional(),
       headingDepth: z.number().optional(),
@@ -465,7 +483,7 @@ export function createMcpServer(deps: McpDependencies): McpServer {
         headingDepth: z.number().optional(),
       })).optional().describe("For bulk_read: array of files to read, each with optional heading to extract."),
     },
-  }, async ({ action, path: notePath, query, maxChunks, heading, headingDepth, lineNumbers, stat, directory, items }) => {
+  }, async ({ action, path: notePath, query, maxChunks, heading, headingDepth, lineNumbers, stat, pattern, directory, items }) => {
     return wrapTool(deps.workflow, "view", takePrimingContext(), async () => {
       // Reads a note, rethrowing PathIsDirectoryError with an action-specific
       // hint so callers learn that `path` must point to a file, not a folder.
@@ -666,6 +684,11 @@ export function createMcpServer(deps: McpDependencies): McpServer {
           const backlinks = deps.backlinkIndex.getBacklinks(notePath);
           return { target: notePath, backlinks, count: backlinks.length };
         }
+        case "glob": {
+          if (!pattern) throw new InvalidArgumentError("pattern");
+          const files = await deps.fsAdapter.listNotes();
+          return matchGlob(pattern, files);
+        }
         default:
           throw new InvalidArgumentError("action");
         }
@@ -722,14 +745,16 @@ export function createMcpServer(deps: McpDependencies): McpServer {
   server.registerTool("system", {
     title: "System",
     description:
-      `System administration for this vault (${vaultScope}). Actions: status (indexing/backlinks/workflow health), reindex (async rebuild), overview (folder tree), overview_status (meta/overview.md state), prepare_overview (gather evidence), save_overview (persist host-written overview).`,
+      `System administration for this vault (${vaultScope}). Actions: status (indexing/backlinks/workflow health), reindex (async rebuild), overview (folder tree), overview_status (meta/overview.md state), prepare_overview (gather evidence), save_overview (persist host-written overview), selftest (in-vault round-trip check), normalize_links (canonicalize escaped wiki-links, dryRun by default).`,
     inputSchema: {
-      action: z.enum(["status", "reindex", "overview", "overview_status", "prepare_overview", "save_overview"]),
+      action: z.enum(["status", "reindex", "overview", "overview_status", "prepare_overview", "save_overview", "selftest", "normalize_links"]),
       maxDepth: z.number().optional().describe("Maximum folder depth for overview (default 3)."),
       overview: z.string().optional().describe("Overview text to save (required for save_overview action)."),
       scope: z.string().optional().describe("One-line vault routing hint, max 200 chars (required for save_overview action). Should describe what information agents can find here."),
+      path: z.string().optional().describe("Note path (required for normalize_links)."),
+      dryRun: z.boolean().optional().describe("For normalize_links: preview the diff without writing (default true)."),
     },
-  }, async ({ action, maxDepth, overview, scope }) => {
+  }, async ({ action, maxDepth, overview, scope, path: notePath, dryRun }) => {
     return wrapTool(deps.workflow, "system", takePrimingContext(), async () => {
       switch (action) {
         case "status": {
@@ -793,6 +818,15 @@ export function createMcpServer(deps: McpDependencies): McpServer {
           const manager = new OverviewManager({ fsAdapter: deps.fsAdapter });
           await manager.saveOverview(overview.trim(), scope.trim());
           return { saved: true, path: "meta/overview.md" };
+        }
+        case "selftest": {
+          const useCase = new SelftestUseCase(deps.fsAdapter);
+          return useCase.execute();
+        }
+        case "normalize_links": {
+          if (!notePath) throw new InvalidArgumentError("path");
+          const useCase = new NormalizeLinksUseCase(deps.fsAdapter, new UnifiedDiffService());
+          return useCase.execute({ path: notePath, dryRun });
         }
         default:
           throw new InvalidArgumentError("action");

@@ -1700,3 +1700,153 @@ describe("edit tool — byte-preserving heading edits (C1)", () => {
     expect(after).toContain("keep_this_underscore");
   });
 });
+
+// ── view.glob (B4) ────────────────────────────────────────────────
+
+describe("view.glob (B4)", () => {
+  it("lists paths matching a glob pattern", async () => {
+    await fs.mkdir(path.join(tmpDir, "gdir", "deep"), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, "gdir/a.md"), "# A\n");
+    await fs.writeFile(path.join(tmpDir, "gdir/deep/b.md"), "# B\n");
+
+    const result = await client.callTool({
+      name: "view",
+      arguments: { action: "glob", pattern: "gdir/**/*.md" },
+    });
+
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      result: string[];
+    };
+    expect(parsed.result).toEqual(["gdir/a.md", "gdir/deep/b.md"]);
+  });
+
+  it("errors when pattern is missing", async () => {
+    const result = await client.callTool({ name: "view", arguments: { action: "glob" } });
+    expect(result.isError).toBe(true);
+  });
+});
+
+// ── system.selftest (A4) ──────────────────────────────────────────
+
+describe("system.selftest (A4)", () => {
+  it("runs the in-vault round-trip and reports PASS", async () => {
+    const result = await client.callTool({
+      name: "system",
+      arguments: { action: "selftest" },
+    });
+    expect(result.isError).toBeFalsy();
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      result: { status: string; steps: Array<{ ok: boolean }> };
+    };
+    expect(parsed.result.status).toBe("PASS");
+    expect(parsed.result.steps.every((step) => step.ok)).toBe(true);
+  });
+});
+
+// ── system.normalize_links (C3) ───────────────────────────────────
+
+describe("system.normalize_links (C3)", () => {
+  it("previews by default and does not write", async () => {
+    const original = "# T\n\n\\[\\[Agent/a]] and \\_x\n";
+    await fs.writeFile(path.join(tmpDir, "links.md"), original);
+
+    const result = await client.callTool({
+      name: "system",
+      arguments: { action: "normalize_links", path: "links.md" },
+    });
+
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      result: { dryRun: boolean; replacements: number; diff?: string };
+    };
+    expect(parsed.result.dryRun).toBe(true);
+    expect(parsed.result.replacements).toBeGreaterThan(0);
+    expect(parsed.result.diff).toBeDefined();
+    expect(await fs.readFile(path.join(tmpDir, "links.md"), "utf-8")).toBe(original);
+  });
+
+  it("writes canonical links when dryRun=false", async () => {
+    await fs.writeFile(path.join(tmpDir, "links2.md"), "# T\n\n\\[\\[Agent/a]]\n");
+
+    await client.callTool({
+      name: "system",
+      arguments: { action: "normalize_links", path: "links2.md", dryRun: false },
+    });
+
+    const after = await fs.readFile(path.join(tmpDir, "links2.md"), "utf-8");
+    expect(after).toContain("[[Agent/a]]");
+    expect(after).not.toContain("\\[\\[");
+  });
+});
+
+// ── vault create: content sanity warnings (C2) ────────────────────
+
+describe("vault create — content sanity warnings (C2)", () => {
+  it("returns warnings for model-escape artifacts", async () => {
+    const result = await client.callTool({
+      name: "vault",
+      arguments: {
+        action: "create",
+        path: "warn.md",
+        content: "foo\\nbar and &#x6E;_&#x434;о\n",
+      },
+    });
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      result: { message: string; warnings: string[] };
+    };
+    expect(parsed.result.message).toContain("created");
+    expect(parsed.result.warnings.length).toBeGreaterThan(0);
+  });
+
+  it("returns a plain string for clean content", async () => {
+    const result = await client.callTool({
+      name: "vault",
+      arguments: { action: "create", path: "clean.md", content: "# Clean\n" },
+    });
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text);
+    expect(typeof parsed.result).toBe("string");
+  });
+});
+
+// ── view.read: raw round-trip (C4) ────────────────────────────────
+
+describe("view.read — raw round-trip (C4)", () => {
+  it("returns content byte-for-byte", async () => {
+    const raw =
+      "---\r\ntitle: X\r\n---\r\n\r\n# H\r\n\r\n\\[\\[Agent/a]] and \\_x and  two  spaces\r\n";
+    await fs.writeFile(path.join(tmpDir, "raw.md"), raw);
+
+    const result = await client.callTool({
+      name: "view",
+      arguments: { action: "read", path: "raw.md" },
+    });
+
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      result: string;
+    };
+    expect(parsed.result).toBe(raw);
+  });
+});
+
+// ── edit tool: escaped-character round-trip (D2) ──────────────────
+
+describe("edit tool — escaped-character round-trip (D2)", () => {
+  it("replaces a line with escaped links, underscores, em dash and cyrillic", async () => {
+    const line = "Line with \\[\\[Agent/x]] and \\_text and — em dash and кириллица";
+    await fs.writeFile(path.join(tmpDir, "d2.md"), `# T\n\n${line}\n\nTail.\n`);
+
+    const result = await client.callTool({
+      name: "edit",
+      arguments: {
+        path: "d2.md",
+        operation: "string_replace",
+        searchText: line,
+        content: "Replaced.",
+      },
+    });
+
+    expect(result.isError).toBeFalsy();
+    const after = await fs.readFile(path.join(tmpDir, "d2.md"), "utf-8");
+    expect(after).toContain("Replaced.");
+    expect(after).toContain("Tail.");
+  });
+});
