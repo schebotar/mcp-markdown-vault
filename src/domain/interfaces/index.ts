@@ -1,4 +1,9 @@
-export type { IFileSystemAdapter, NoteStat } from "./file-system-adapter.js";
+export type {
+  IFileSystemAdapter,
+  NoteStat,
+  ListNotesOptions,
+  DeleteNoteOptions,
+} from "./file-system-adapter.js";
 export type { IEmbeddingProvider } from "./embedding-provider.js";
 export type {
   IVectorStore,

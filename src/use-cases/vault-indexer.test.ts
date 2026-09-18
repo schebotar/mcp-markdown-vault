@@ -708,3 +708,71 @@ describe("VaultIndexer", () => {
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+// ── Service directories are never indexed (P0-3) ──────────────────
+
+describe("VaultIndexer — service directories (P0-3)", () => {
+  it("refuses to index a note under a dot-directory", async () => {
+    await fs.mkdir(path.join(tmpDir, ".stversions/Встречи"), { recursive: true });
+    await fs.writeFile(
+      path.join(tmpDir, ".stversions/Встречи/2026-09-15~20260915-143824.md"),
+      "# Historical\n\nsecret needle content\n",
+    );
+
+    await indexer.indexFile(".stversions/Встречи/2026-09-15~20260915-143824.md");
+
+    expect(await store.has(".stversions/Встречи/2026-09-15~20260915-143824.md")).toBe(false);
+  });
+
+  it("drops a stale entry for an ignored path", async () => {
+    await fs.mkdir(path.join(tmpDir, ".trash"), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, ".trash/deleted.md"), "# Deleted\n\nbody\n");
+    await store.upsert({
+      docPath: ".trash/deleted.md",
+      chunks: [{ chunkId: "root", vector: [1, 0, 0], text: "deleted", headingPath: [] }],
+    });
+    expect(await store.has(".trash/deleted.md")).toBe(true);
+
+    await indexer.indexFile(".trash/deleted.md");
+
+    expect(await store.has(".trash/deleted.md")).toBe(false);
+  });
+
+  it("ignores watcher events for service-directory notes", async () => {
+    await indexer.startWatching({ debounceMs: 1 });
+    await fs.mkdir(path.join(tmpDir, ".stversions"), { recursive: true });
+    const abs = path.join(tmpDir, ".stversions/x.md");
+    await fs.writeFile(abs, "# X\n\nbody\n");
+
+    watcher.emit("add", abs);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(await store.has(".stversions/x.md")).toBe(false);
+  });
+
+  it("still indexes normal notes emitted by the watcher", async () => {
+    await indexer.startWatching({ debounceMs: 1 });
+    const abs = path.join(tmpDir, "normal.md");
+    await fs.writeFile(abs, "# Normal\n\nbody\n");
+
+    watcher.emit("add", abs);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(await store.has("normal.md")).toBe(true);
+  });
+
+  it("indexAll purges entries left by an older version and skips service dirs", async () => {
+    await fs.mkdir(path.join(tmpDir, ".stversions"), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, "real.md"), "# Real\n\ncontent\n");
+    await fs.writeFile(path.join(tmpDir, ".stversions/old.md"), "# Old\n\ncontent\n");
+    await store.upsert({
+      docPath: ".stversions/old.md",
+      chunks: [{ chunkId: "root", vector: [0, 1, 0], text: "old", headingPath: [] }],
+    });
+
+    await indexer.indexAll();
+
+    expect(await store.has("real.md")).toBe(true);
+    expect(await store.has(".stversions/old.md")).toBe(false);
+  });
+});

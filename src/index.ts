@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import { realpathSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { LocalFileSystemAdapter } from "./infrastructure/local-fs-adapter.js";
 import { ChokidarFileWatcher } from "./infrastructure/chokidar-file-watcher.js";
@@ -31,6 +33,10 @@ import {
   type VaultContextMode,
 } from "./use-cases/vault-context-config.js";
 import { extractVaultScopeFromFrontmatter } from "./use-cases/vault-scope.js";
+import {
+  parseVaultIgnoreEnv,
+  parseVaultIgnoreFile,
+} from "./use-cases/vault-ignore.js";
 
 export const DEFAULT_VAULT_SCOPE = "general markdown notes vault";
 
@@ -161,6 +167,27 @@ async function createEmbeddingProvider(): Promise<IEmbeddingProvider> {
   return new TransformersEmbeddingProvider();
 }
 
+/**
+ * Collect the extra note-ignore glob patterns from `VAULT_IGNORE` (CSV) and
+ * the optional `.vaultignore` file at the vault root. Dot-prefixed service
+ * directories are ignored unconditionally (see `vault-ignore.ts`).
+ */
+export async function loadIgnorePatterns(vaultRoot: string): Promise<string[]> {
+  const patterns = parseVaultIgnoreEnv(process.env["VAULT_IGNORE"]);
+
+  try {
+    const text = await readFile(
+      path.join(path.resolve(vaultRoot), ".vaultignore"),
+      "utf-8",
+    );
+    patterns.push(...parseVaultIgnoreFile(text));
+  } catch {
+    // No .vaultignore file — that is the common case.
+  }
+
+  return [...new Set(patterns)];
+}
+
 async function main(): Promise<void> {
   const vaultRoot = process.env["VAULT_PATH"] ?? "/vault";
   const config = parseVaultContextConfig(process.env);
@@ -179,7 +206,10 @@ async function main(): Promise<void> {
     process.env["VECTOR_STORE_COLLECTION"] ?? "markdown_vault";
   const allowReset = process.env["VECTOR_STORE_RESET"] === "true";
 
-  const fsAdapter = await LocalFileSystemAdapter.create(vaultRoot);
+  const ignorePatterns = await loadIgnorePatterns(vaultRoot);
+  const fsAdapter = await LocalFileSystemAdapter.create(vaultRoot, {
+    ignorePatterns,
+  });
   const { getVaultScope } = await initializeVaultOrientation({
     fsAdapter,
     mode: config.mode,
@@ -215,6 +245,7 @@ async function main(): Promise<void> {
     embedder,
     fileWatcher,
     fsAdapter,
+    { ignorePatterns },
   );
 
   indexer.addOnFileIndexed((relPath, content) => {
@@ -232,6 +263,7 @@ async function main(): Promise<void> {
     backlinkIndex,
     indexer,
     getVaultScope,
+    ignorePatterns,
   });
 
   indexer

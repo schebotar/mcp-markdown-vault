@@ -5,30 +5,21 @@ import type {
   FolderSummary,
 } from "../domain/interfaces/vault-overview-service.js";
 
-// Directory patterns to skip
-const HIDDEN_SEGMENT_RE = /^\./;
-const IGNORED_SEGMENTS = new Set(["node_modules"]);
-
-function isHiddenPath(filePath: string): boolean {
-  const segments = filePath.split("/");
-  return segments.some(
-    (seg) => HIDDEN_SEGMENT_RE.test(seg) || IGNORED_SEGMENTS.has(seg),
-  );
-}
-
 /**
  * Service that builds an overview of the vault structure.
  * Uses IFileSystemAdapter to read file lists and metadata.
+ *
+ * Note: filtering of service directories (`.obsidian`, `.trash`,
+ * `.stversions`, `node_modules`, `VAULT_IGNORE`/`.vaultignore` matches) lives
+ * in the file-system adapter (`vault-ignore.ts`), so the overview, `vault
+ * list`, `view.glob` and the vector index all agree on the same note set.
  */
 export class VaultOverviewService implements IVaultOverviewService {
   constructor(private readonly fsAdapter: IFileSystemAdapter) {}
 
   async getOverview(maxDepth?: number): Promise<VaultOverview> {
     const depth = maxDepth ?? 3;
-    const allFiles = await this.fsAdapter.listNotes();
-
-    // Filter out files from hidden directories
-    const files = allFiles.filter((f) => !isHiddenPath(f));
+    const files = await this.fsAdapter.listNotes();
 
     if (files.length === 0) {
       return { totalFiles: 0, folders: [] };

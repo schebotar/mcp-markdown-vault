@@ -1,6 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ServerOptions } from "@modelcontextprotocol/sdk/server/index.js";
-import yaml from "js-yaml";
 import { z } from "zod";
 import type { IFileSystemAdapter } from "../domain/interfaces/file-system-adapter.js";
 import type { IEmbeddingProvider, IVectorStore } from "../domain/interfaces/index.js";
@@ -11,6 +10,7 @@ import { AstNavigator } from "../use-cases/ast-navigation.js";
 import { AstPatcher } from "../use-cases/ast-patcher.js";
 import type { PatchOperation } from "../use-cases/ast-patcher.js";
 import { TextPatcher } from "../use-cases/text-patcher.js";
+import { HeadingResolver } from "../use-cases/heading-target.js";
 import { FragmentRetriever } from "../use-cases/fragment-retrieval.js";
 import { FuzzyMatcher } from "../use-cases/fuzzy-match.js";
 import { VaultSearcher } from "../use-cases/vault-search.js";
@@ -29,17 +29,26 @@ import { VaultIndexer } from "../use-cases/vault-indexer.js";
 import { MarkdownFileRepository } from "../infrastructure/markdown-file-repository.js";
 import { RegexTemplateEngine } from "../infrastructure/regex-template-engine.js";
 import { UnifiedDiffService } from "../infrastructure/diff-service.js";
-import { DomainError, InvalidArgumentError, OutlineLimitExceededError, AmbiguousHeadingTargetError, InvalidFrontmatterYamlError, PathIsDirectoryError, FreeformEditError, NoteNotFoundError } from "../domain/errors/index.js";
+import { DomainError, InvalidArgumentError, OutlineLimitExceededError, AmbiguousHeadingTargetError, HeadingNotFoundError, PathIsDirectoryError, FreeformEditError, NoteNotFoundError } from "../domain/errors/index.js";
 import { OverviewManager } from "../use-cases/overview-manager.js";
 import { VaultStatsComposer } from "../use-cases/vault-stats.js";
 import { VaultOverviewResourceComposer } from "../use-cases/vault-resource-overview.js";
 import { fingerprintNote } from "../use-cases/file-fingerprint.js";
 import { buildStringNotFoundMessage, logStringReplaceFailure } from "../use-cases/string-not-found.js";
-import { extractFrontmatterRaw, replaceFrontmatterBlock } from "../use-cases/frontmatter-surgery.js";
+import { mergeFrontmatterPreservingStyle } from "../use-cases/frontmatter-surgery.js";
 import { matchGlob } from "../use-cases/glob.js";
+import { buildDirectoryTree } from "../use-cases/directory-outline.js";
+import { matchesIgnorePattern } from "../use-cases/vault-ignore.js";
 import { checkContentSanity } from "../use-cases/content-sanity.js";
 import { NormalizeLinksUseCase } from "../use-cases/normalize-links.js";
 import { SelftestUseCase } from "../use-cases/selftest.js";
+
+/**
+ * Hard ceiling for an explicitly requested `outline` file limit. The old
+ * server failed at 50 files with no way around it; now the default pages the
+ * output and only an over-large EXPLICIT limit is rejected.
+ */
+const OUTLINE_MAX_LIMIT = 500;
 
 export interface McpDependencies {
   fsAdapter: IFileSystemAdapter;
@@ -51,6 +60,8 @@ export interface McpDependencies {
   indexer?: VaultIndexer | undefined;
   instructions?: string | undefined;
   getVaultScope?: (() => string) | undefined;
+  /** Extra ignore globs (VAULT_IGNORE / .vaultignore) for the search layer. */
+  ignorePatterns?: readonly string[] | undefined;
 }
 
 /**
@@ -118,15 +129,48 @@ export function createMcpServer(deps: McpDependencies): McpServer {
       path: z.string().optional(),
       directory: z.string().optional(),
       content: z.string().optional(),
+      limit: z.number().optional().describe("For list: maximum number of paths to return (default 100)."),
+      offset: z.number().optional().describe("For list: number of paths to skip."),
+      mode: z.enum(["flat", "tree"]).optional().describe("For list: 'flat' (default) returns paths up to limit; 'tree' returns a subdirectory summary with file counts (like vault overview)."),
+      maxDepth: z.number().optional().describe("For list mode='tree': maximum directory depth to expand (default 3)."),
+      includeHidden: z.boolean().optional().describe("For list: include service directories (.obsidian, .trash, .stversions, …) and VAULT_IGNORE/.vaultignore matches (default false)."),
+      pruneEmptyDirs: z.boolean().optional().describe("For delete: also remove parent directories that became empty."),
       templatePath: z.string().optional().describe("Source template file path (for create_from_template)."),
       variables: z.record(z.string(), z.string()).optional().describe("Key-value variables to inject into template placeholders (for create_from_template)."),
     },
-  }, async ({ action, path, directory, content, templatePath, variables }) => {
+  }, async ({ action, path, directory, content, limit, offset, mode, maxDepth, includeHidden, pruneEmptyDirs, templatePath, variables }) => {
     return wrapTool(deps.workflow, "vault", takePrimingContext(), async () => {
       switch (action) {
         case "list": {
-          const notes = await deps.fsAdapter.listNotes(directory);
-          return notes;
+          const notes = await deps.fsAdapter.listNotes(
+            directory,
+            includeHidden ? { includeHidden: true } : undefined,
+          );
+          if (mode === "tree") {
+            const tree = buildDirectoryTree(notes, directory ?? "", maxDepth ?? 3);
+            return {
+              directory: directory ?? "",
+              mode: "tree" as const,
+              totalFiles: notes.length,
+              totalDirectories: tree.root.totalDirectories,
+              maxDepth: maxDepth ?? 3,
+              truncated: tree.truncated,
+              folders: tree.root.children,
+            };
+          }
+          const effectiveLimit = limit ?? 100;
+          const effectiveOffset = offset ?? 0;
+          const page = notes.slice(effectiveOffset, effectiveOffset + effectiveLimit);
+          return {
+            directory: directory ?? "",
+            mode: "flat" as const,
+            totalFiles: notes.length,
+            offset: effectiveOffset,
+            limit: effectiveLimit,
+            returned: page.length,
+            truncated: effectiveOffset + page.length < notes.length,
+            notes: page,
+          };
         }
         case "read": {
           if (!path) throw new InvalidArgumentError("path");
@@ -158,10 +202,15 @@ export function createMcpServer(deps: McpDependencies): McpServer {
         }
         case "delete": {
           if (!path) throw new InvalidArgumentError("path");
-          await deps.fsAdapter.deleteNote(path);
+          await deps.fsAdapter.deleteNote(
+            path,
+            pruneEmptyDirs ? { pruneEmptyDirs: true } : undefined,
+          );
           deps.backlinkIndex?.removeFile(path);
           deps.indexer?.removeFile(path).catch(() => {/* background */});
-          return `Note deleted: ${path}`;
+          return pruneEmptyDirs
+            ? `Note deleted: ${path} (empty parent directories pruned)`
+            : `Note deleted: ${path}`;
         }
         case "stat": {
           if (!path) throw new InvalidArgumentError("path");
@@ -195,13 +244,14 @@ export function createMcpServer(deps: McpDependencies): McpServer {
   server.registerTool("edit", {
     title: "Edit",
     description:
-      `Edit notes safely. Vault scope: ${vaultScope}. Supports AST edits by heading/block ID, freeform line/string replacement, frontmatter_set metadata merges, batch operations (max 50), and dryRun=true unified diff previews. Read vault://overview for editing strategy and conventions.\n\nTIPS: Always use dryRun=true before destructive operations (delete, replace). Use bulk_read for reading 2+ files. Use view.outline before heading-specific edits when unsure of heading names. string_replace requires exact literal match including whitespace/newlines. Write wiki-links unescaped as [[path]] (not \\[[path]]).`,
+      `Edit notes safely. Vault scope: ${vaultScope}. Supports AST edits by heading/block ID, freeform line/string replacement, frontmatter_set metadata merges, batch operations (max 50), and dryRun=true unified diff previews. Read vault://overview for editing strategy and conventions.\n\nTIPS: Always use dryRun=true before destructive operations (delete, replace). Use bulk_read for reading 2+ files. Use view.outline before heading-specific edits when unsure of heading names. string_replace requires exact literal match including whitespace/newlines. Write wiki-links unescaped as [[path]] (not \\[[path]]).\n\nBYTE PRESERVATION: content is inserted verbatim and only the targeted region is rewritten — dash bullets, tables, underscore escapes and [[wiki-links]] elsewhere in the file stay byte-for-byte. Pass normalize=true to opt into canonical remark re-serialization of the whole file.\n\nFRONTMATTER: edit operation="frontmatter_set" takes a frontmatter object, e.g. {"status":"draft"} — content is then not required (the legacy form, a JSON object string in content, still works). Existing keys keep their order, quoting and comments.`,
     inputSchema: {
       path: z.string().optional().describe("Note path (required for single edit)."),
-      operation: z.enum(["append", "prepend", "replace", "delete", "line_replace", "string_replace", "frontmatter_set"]).optional().describe("Edit operation (required for single edit). 'delete' removes the full heading section including child headings. 'replace' by default replaces only the body under the heading (heading node preserved). Use replaceMode='section' to replace the heading and all its content."),
-      content: z.string().optional().describe("Content to apply (required for single edit, ignored for delete)."),
+      operation: z.enum(["append", "prepend", "replace", "delete", "line_replace", "string_replace", "frontmatter_set"]).optional().describe("Edit operation (required for single edit). 'delete' removes the full heading section including child headings. 'replace' by default replaces only the body under the heading (heading node preserved); with no heading/blockId it replaces the document body and keeps the frontmatter. Use replaceMode='section' to replace the heading and all its content."),
+      content: z.string().optional().describe("Content to apply (required for single edit except delete and frontmatter_set; ignored for delete). Inserted verbatim — no markdown normalization."),
+      frontmatter: z.record(z.string(), z.unknown()).optional().describe('For frontmatter_set: object of fields to merge, e.g. {"status":"draft"}. Replaces the need for a JSON string in `content`.'),
       heading: z.string().optional(),
-      headingDepth: z.number().optional(),
+      headingDepth: z.number().optional().describe("Heading depth to target (default 2). On a miss the server also looks at other depths: a unique match is applied and reported via resolvedDepth; several matches are listed with their headingDepth."),
       replaceMode: z.enum(["body", "section"]).optional().describe("For replace operation: 'body' (default) preserves the heading node and replaces only body content. 'section' replaces the entire heading section including the heading node and all child headings."),
       blockId: z.string().optional(),
       startLine: z.number().optional(),
@@ -209,12 +259,14 @@ export function createMcpServer(deps: McpDependencies): McpServer {
       searchText: z.string().optional(),
       replaceAll: z.boolean().optional(),
       expectLine: z.string().optional().describe("For line_replace: verify that startLine contains this text (after trim) before replacing; on mismatch the error reports the actual line content."),
+      normalize: z.boolean().optional().describe("Default false: only the targeted region is rewritten (byte-preserving). Set true to re-serialize the whole document through remark (canonical bullets/tables/escapes)."),
       dryRun: z.boolean().optional().describe("If true, returns a preview of changes as a unified diff without saving to disk."),
       returnContent: z.enum(["none", "section", "file"]).optional().describe("When set to 'section' or 'file', the response includes the modified content (max 8KB). Defaults to 'none'."),
       operations: z.array(z.object({
         path: z.string(),
         operation: z.enum(["append", "prepend", "replace", "delete", "line_replace", "string_replace", "frontmatter_set"]),
         content: z.string().optional(),
+        frontmatter: z.record(z.string(), z.unknown()).optional(),
         heading: z.string().optional(),
         headingDepth: z.number().optional(),
         replaceMode: z.enum(["body", "section"]).optional(),
@@ -224,9 +276,10 @@ export function createMcpServer(deps: McpDependencies): McpServer {
         searchText: z.string().optional(),
         replaceAll: z.boolean().optional(),
         expectLine: z.string().optional(),
+        normalize: z.boolean().optional(),
       })).optional().describe("For batch mode: array of edit operations (max 50). Executed sequentially, stops on first error."),
     },
-  }, async ({ path: notePath, operation, content, heading, headingDepth, replaceMode, blockId, startLine, endLine, searchText, replaceAll, expectLine, dryRun, returnContent, operations }) => {
+  }, async ({ path: notePath, operation, content, frontmatter, heading, headingDepth, replaceMode, blockId, startLine, endLine, searchText, replaceAll, expectLine, normalize, dryRun, returnContent, operations }) => {
     return wrapTool(deps.workflow, "edit", takePrimingContext(), async () => {
       // Helper: update indexes after file write
       // Backlinks synchronously (required for consistency), vectors in background
@@ -261,7 +314,25 @@ export function createMcpServer(deps: McpDependencies): McpServer {
       // ── Single mode — validate required fields ─────────────
       if (!notePath) throw new InvalidArgumentError("path");
       if (!operation) throw new InvalidArgumentError("operation");
-      if (content === undefined && operation !== "delete") throw new InvalidArgumentError("content");
+      if (
+        operation !== "delete"
+        && operation !== "frontmatter_set"
+        && content === undefined
+      ) {
+        throw new InvalidArgumentError("content");
+      }
+      if (
+        operation === "frontmatter_set"
+        && content === undefined
+        && frontmatter === undefined
+      ) {
+        throw new InvalidArgumentError(
+          "frontmatter (or legacy JSON in content)",
+          'Call edit with operation="frontmatter_set" and a frontmatter object, e.g. '
+            + 'edit { path, operation: "frontmatter_set", frontmatter: { "status": "draft" } }. '
+            + 'Backwards compatibility: content: \'{"status":"draft"}\' (a JSON object string, not YAML).',
+        );
+      }
 
       const source = await deps.fsAdapter.readNote(notePath);
       const contentWarnings =
@@ -276,20 +347,25 @@ export function createMcpServer(deps: McpDependencies): McpServer {
       const enrichAndFinalize = async (
         editResult: import("../use-cases/dry-run-edit.js").DryRunEditResponse,
         newContent: string,
-        targetResolved?: string | undefined,
+        extras?: Record<string, unknown> | undefined,
       ): Promise<import("../use-cases/dry-run-edit.js").DryRunEditResponse> => {
         if (!(dryRun ?? false)) {
           await syncIndexes(notePath);
         }
+        const extraWarnings = Array.isArray(extras?.["warnings"])
+          ? (extras["warnings"] as string[])
+          : [];
+        const { warnings: _ignored, ...rest } = extras ?? {};
         const enriched: import("../use-cases/dry-run-edit.js").DryRunEditResponse = {
           ...editResult,
+          ...rest,
           changed: source !== newContent,
           operation,
           path: notePath,
-          ...(targetResolved !== undefined ? { targetResolved } : {}),
         };
-        if (contentWarnings.length > 0) {
-          enriched.warnings = contentWarnings;
+        const allWarnings = [...contentWarnings, ...extraWarnings];
+        if (allWarnings.length > 0) {
+          enriched.warnings = allWarnings;
         }
         const rc = returnContent ?? "none";
         if (rc === "file") {
@@ -358,37 +434,26 @@ export function createMcpServer(deps: McpDependencies): McpServer {
 
       // ── Frontmatter operation ──────────────────────────────────
       if (operation === "frontmatter_set") {
-        if (content === undefined) throw new InvalidArgumentError("content");
-        const parsed = parseFrontmatterPayload(content);
+        // Preferred form: a `frontmatter` object. Legacy form: a JSON object
+        // string in `content` (kept for backwards compatibility).
+        const patch = frontmatter ?? parseFrontmatterPayload(content as string);
 
-        // Byte-preserving: only the frontmatter block is rewritten; the body
-        // is never passed through remark-stringify.
-        const rawFrontmatter = extractFrontmatterRaw(source);
-        let existing: Record<string, unknown> = {};
-        if (rawFrontmatter !== undefined) {
-          try {
-            const loaded = yaml.load(rawFrontmatter);
-            if (typeof loaded === "object" && loaded !== null) {
-              existing = loaded as Record<string, unknown>;
-            }
-          } catch (err) {
-            throw new InvalidFrontmatterYamlError(notePath, err);
-          }
-        }
-        const mergedFrontmatter = Object.assign({}, existing, parsed);
-        const newContent = replaceFrontmatterBlock(
-          source,
-          yaml.dump(mergedFrontmatter).trimEnd(),
-        );
+        // Byte-preserving: only the touched keys inside the frontmatter block
+        // are rewritten; order, quoting, comments and the body survive.
+        const merge = mergeFrontmatterPreservingStyle(source, patch);
 
         const result = await dryRunEditor.execute({
           path: notePath,
           oldContent: source,
-          newContent,
+          newContent: merge.content,
           dryRun: dryRun ?? false,
           operationLabel: "frontmatter_set",
         });
-        return enrichAndFinalize(result, newContent);
+        return enrichAndFinalize(result, merge.content, {
+          updatedKeys: merge.updatedKeys,
+          addedKeys: merge.addedKeys,
+          ...(merge.warnings.length > 0 ? { warnings: merge.warnings } : {}),
+        });
       }
 
       // ── AST operations ──────────────────────────────────────────
@@ -396,35 +461,21 @@ export function createMcpServer(deps: McpDependencies): McpServer {
 
       // Build target
       let target: Parameters<typeof AstPatcher.apply>[1]["target"];
-      let targetResolved: string | undefined;
+      const extras: Record<string, unknown> = {};
 
       if (blockId) {
         target = { blockId };
       } else if (heading) {
-        const depth = headingDepth ?? 2;
-
-        // Check for exact duplicates first — throw before fuzzy matching
-        const allHeadings = AstNavigator.findAllHeadings(tree);
-        const exactDuplicates = AstNavigator.findAllMatchingHeadings(tree, heading, depth);
-        if (exactDuplicates.length > 1) {
-          throw new AmbiguousHeadingTargetError(heading, depth, exactDuplicates);
+        // The resolver tolerates a wrong headingDepth: it falls back to other
+        // depths, reports resolvedDepth, and lists candidates when ambiguous.
+        const resolution = HeadingResolver.resolve(tree, heading, headingDepth);
+        target = { heading: resolution.title, depth: resolution.depth };
+        extras["targetResolved"] = resolution.title;
+        if (resolution.resolvedDepth !== undefined) {
+          extras["resolvedDepth"] = resolution.resolvedDepth;
         }
-
-        // Fuzzy match the heading title
-        const candidates = allHeadings
-          .filter((h) => h.depth === depth)
-          .map((h) => h.title);
-
-        if (candidates.length > 0) {
-          const matched = FuzzyMatcher.bestMatch(heading, candidates, 0.6);
-          if (matched) {
-            target = { heading: matched.match, depth };
-            targetResolved = matched.match;
-          } else {
-            target = { heading, depth };
-          }
-        } else {
-          target = { heading, depth };
+        if (resolution.warning !== undefined) {
+          extras["warnings"] = [resolution.warning];
         }
       } else {
         target = "document";
@@ -436,11 +487,14 @@ export function createMcpServer(deps: McpDependencies): McpServer {
         content: content ?? "",
         replaceMode,
       };
-      // Heading/block edits preserve the rest of the file byte-for-byte;
-      // document targets (and missing offsets) fall back to AST re-serialization.
-      let newContent = target === "document"
-        ? undefined
-        : TextPatcher.apply(source, tree, patchRequest, pipeline);
+      // By default only the targeted region is spliced into the ORIGINAL text.
+      // `normalize: true` opts back into full remark re-serialization.
+      let newContent: string | undefined;
+      if (!(normalize ?? false)) {
+        newContent = target === "document"
+          ? TextPatcher.applyDocument(source, patchRequest)
+          : TextPatcher.apply(source, tree, patchRequest);
+      }
       if (newContent === undefined) {
         AstPatcher.apply(tree, patchRequest, pipeline);
         newContent = pipeline.stringify(tree);
@@ -453,7 +507,7 @@ export function createMcpServer(deps: McpDependencies): McpServer {
         dryRun: dryRun ?? false,
         operationLabel: operation,
       });
-      return enrichAndFinalize(result, newContent, targetResolved);
+      return enrichAndFinalize(result, newContent, extras);
     });
   });
 
@@ -465,10 +519,10 @@ export function createMcpServer(deps: McpDependencies): McpServer {
   server.registerTool("view", {
     title: "View",
     description:
-      `Read and search markdown notes. Vault scope: ${vaultScope}.\nActions: search (heading-aware fragment retrieval with TF-IDF + proximity; file-scoped when path is given, otherwise vault- or directory-wide), semantic_search (vector + lexical hybrid for conceptual queries), global_search (cross-vault exact-match grep), outline (file or directory structure tree), read (full file or single section by heading; supports lineNumbers and stat), glob (list paths matching a glob pattern), frontmatter_get (parse YAML frontmatter), bulk_read (read multiple files/headings in one call), backlinks (find all notes linking to a given path). Wiki-links are canonical unescaped [[path]]; use system.normalize_links to fix escaped \\[[ forms.`,
+      `Read and search markdown notes. Vault scope: ${vaultScope}.\nActions: search (heading-aware fragment retrieval with TF-IDF + proximity; file-scoped when path is given, otherwise vault- or directory-wide), semantic_search (vector + lexical hybrid for conceptual queries), global_search (cross-vault exact-match grep), outline (file headings, or a directory summary tree with file counts — pass mode='files' plus limit/offset for the full per-file listing), read (full file or single section by heading; supports lineNumbers and stat), glob (list paths matching a glob pattern; always reports totalFiles/truncated), frontmatter_get (parse YAML frontmatter), bulk_read (read multiple files/headings in one call), backlinks (find all notes linking to a given path). Wiki-links are canonical unescaped [[path]]; use system.normalize_links to fix escaped \\[[ forms. Service directories (.obsidian, .trash, .stversions, …) are excluded from every listing; pass includeHidden=true to see them.`,
     inputSchema: {
       action: z.enum(["search", "global_search", "semantic_search", "outline", "read", "glob", "frontmatter_get", "bulk_read", "backlinks"]),
-      path: z.string().optional().describe("Note path (a .md file). Required for read/outline/frontmatter_get/backlinks; optional for search — omit it to search the whole vault or the given directory."),
+      path: z.string().optional().describe("Note path (a .md file). Required for read/outline/frontmatter_get/backlinks; for outline a directory is also accepted; optional for search — omit it to search the whole vault or the given directory (a directory passed as `path` is treated as `directory`)."),
       query: z.string().optional(),
       pattern: z.string().optional().describe("For glob: glob pattern over vault-relative paths (supports *, **, ?). Example: 'projects/**/*.md'."),
       maxChunks: z.number().optional(),
@@ -476,14 +530,21 @@ export function createMcpServer(deps: McpDependencies): McpServer {
       headingDepth: z.number().optional(),
       lineNumbers: z.boolean().optional().describe("For read: prefix each returned line with its 1-based number ('N: content')."),
       stat: z.boolean().optional().describe("For read: include a file fingerprint (size, mtime, sha256[:12]) in the response."),
-      directory: z.string().optional().describe("Scope search/outline to a directory prefix. Used by search/global_search/semantic_search/outline. Example: 'projects/active/'"),
+      directory: z.string().optional().describe("Scope search/outline/glob to a directory prefix. Used by search/global_search/semantic_search/outline/glob. Example: 'projects/active/'"),
+      mode: z.enum(["summary", "files"]).optional().describe("For outline on a directory: 'summary' (default) returns a subdirectory tree with file counts; 'files' returns the per-file headings, paged by limit/offset."),
+      maxDepth: z.number().optional().describe("For outline summary / vault list tree mode: maximum directory depth to expand (default 3)."),
+      limit: z.number().optional().describe("For outline files mode / glob: maximum number of entries to return (default 50 for outline, 100 for glob)."),
+      offset: z.number().optional().describe("For outline files mode / glob: number of entries to skip."),
+      exclude: z.union([z.string(), z.array(z.string())]).optional().describe("For glob: glob pattern(s) to exclude, e.g. '.trash/**' or ['Archive/**']."),
+      sort: z.enum(["path", "mtime"]).optional().describe("For glob: sort matched paths by path (default) or by modification time (newest first)."),
+      includeHidden: z.boolean().optional().describe("For glob: include dot-directories and VAULT_IGNORE/.vaultignore matches (default false)."),
       items: z.array(z.object({
         path: z.string(),
         heading: z.string().optional(),
         headingDepth: z.number().optional(),
       })).optional().describe("For bulk_read: array of files to read, each with optional heading to extract."),
     },
-  }, async ({ action, path: notePath, query, maxChunks, heading, headingDepth, lineNumbers, stat, pattern, directory, items }) => {
+  }, async ({ action, path: notePath, query, maxChunks, heading, headingDepth, lineNumbers, stat, pattern, directory, mode, maxDepth, limit, offset, exclude, sort, includeHidden, items }) => {
     return wrapTool(deps.workflow, "view", takePrimingContext(), async () => {
       // Reads a note, rethrowing PathIsDirectoryError with an action-specific
       // hint so callers learn that `path` must point to a file, not a folder.
@@ -522,32 +583,51 @@ export function createMcpServer(deps: McpDependencies): McpServer {
         switch (action) {
         case "search": {
           if (!query) throw new InvalidArgumentError("query");
+          const searchWarnings: string[] = [];
+          let scope = directory;
           if (notePath) {
-            const source = await readNoteForView(
-              notePath,
-              "path must point to a note file (.md), not a directory. Omit path to search the whole vault, or use directory to scope it (see global_search/semantic_search).",
-            );
-            const fragments = retriever.retrieve(source, query, {
-              maxChunks: maxChunks ?? 5,
-            });
-            return fragments.map((f) => ({
-              headingPath: f.chunk.headingPath,
-              text: f.chunk.text,
-              score: Math.round(f.score * 1000) / 1000,
-              wordCount: f.chunk.wordCount,
-            }));
+            try {
+              const source = await readNoteForView(
+                notePath,
+                "path must point to a note file (.md), not a directory. Omit path to search the whole vault, or use directory to scope it (see global_search/semantic_search).",
+              );
+              const fragments = retriever.retrieve(source, query, {
+                maxChunks: maxChunks ?? 5,
+              });
+              return fragments.map((f) => ({
+                headingPath: f.chunk.headingPath,
+                text: f.chunk.text,
+                score: Math.round(f.score * 1000) / 1000,
+                wordCount: f.chunk.wordCount,
+              }));
+            } catch (err) {
+              if (!(err instanceof PathIsDirectoryError)) throw err;
+              // A directory in `path` is not an error any more: treat it as
+              // `directory` and search inside it (P2-8).
+              scope = notePath;
+              searchWarnings.push(
+                `path ${JSON.stringify(notePath)} is a directory; searched inside it instead (use the directory parameter to scope explicitly)`,
+              );
+            }
           }
           const results = await vaultSearcher.search(query, {
             maxResults: maxChunks ?? 20,
-            directory,
+            directory: scope,
           });
-          return results.map((r) => ({
+          const mapped = results.map((r) => ({
             filePath: r.filePath,
             headingPath: r.headingPath,
             text: r.text,
             score: Math.round(r.score * 1000) / 1000,
             wordCount: r.wordCount,
           }));
+          if (searchWarnings.length === 0) return mapped;
+          return {
+            directory: scope,
+            totalResults: mapped.length,
+            warnings: searchWarnings,
+            results: mapped,
+          };
         }
         case "global_search": {
           if (!query) throw new InvalidArgumentError("query");
@@ -568,6 +648,7 @@ export function createMcpServer(deps: McpDependencies): McpServer {
           const results = await hybridSearcher.search(query, {
             k: maxChunks ?? 10,
             directory,
+            ignorePatterns: deps.ignorePatterns ?? [],
           });
           return results.map((r) => ({
             docPath: r.docPath,
@@ -579,16 +660,65 @@ export function createMcpServer(deps: McpDependencies): McpServer {
           }));
         }
         case "outline": {
-          if (directory) {
-            const files = await deps.fsAdapter.listNotes(directory);
-            if (files.length === 0) throw new InvalidArgumentError("directory (no markdown files found)");
-            if (files.length > 50) throw new OutlineLimitExceededError("Directory outline limit: max 50 files");
-            const results = await Promise.all(files.map(async (filePath) => {
+          // Directory outline: `directory`, or a `path` that turns out to be a
+          // directory. Default mode is a compact summary tree; the full
+          // per-file listing stays reachable via mode="files" + limit/offset.
+          const buildDirectoryOutline = async (
+            dir: string,
+            warnings: string[],
+          ): Promise<unknown> => {
+            const files = await deps.fsAdapter.listNotes(dir);
+            if (files.length === 0) {
+              throw new InvalidArgumentError(
+                `directory (no markdown files found in ${JSON.stringify(dir)})`,
+              );
+            }
+            const effectiveMode = mode ?? "summary";
+
+            if (effectiveMode === "summary") {
+              const tree = buildDirectoryTree(files, dir, maxDepth ?? 3);
+              return {
+                directory: dir,
+                mode: "summary" as const,
+                totalFiles: files.length,
+                totalDirectories: tree.root.totalDirectories,
+                maxDepth: maxDepth ?? 3,
+                truncated: tree.truncated,
+                folders: tree.root.children,
+                ...(warnings.length > 0 ? { warnings } : {}),
+                hint: 'pass mode="files" with limit/offset for the per-file heading listing',
+              };
+            }
+
+            // Files mode — paged, never a hard failure.
+            const effectiveLimit = limit ?? 50;
+            if (limit !== undefined && limit > OUTLINE_MAX_LIMIT) {
+              throw new OutlineLimitExceededError(
+                `requested limit ${limit} exceeds the maximum of ${OUTLINE_MAX_LIMIT} files per outline call`,
+              );
+            }
+            const effectiveOffset = offset ?? 0;
+            const page = files.slice(effectiveOffset, effectiveOffset + effectiveLimit);
+            const results = await Promise.all(page.map(async (filePath) => {
               const source = await deps.fsAdapter.readNote(filePath);
               const tree = pipeline.parse(source);
               return { path: filePath, headings: AstNavigator.findAllHeadings(tree) };
             }));
-            return results;
+            return {
+              directory: dir,
+              mode: "files" as const,
+              totalFiles: files.length,
+              offset: effectiveOffset,
+              limit: effectiveLimit,
+              returned: results.length,
+              truncated: effectiveOffset + results.length < files.length,
+              ...(warnings.length > 0 ? { warnings } : {}),
+              files: results,
+            };
+          };
+
+          if (directory) {
+            return buildDirectoryOutline(directory, []);
           }
           if (!notePath) throw new InvalidArgumentError("path");
           try {
@@ -599,22 +729,9 @@ export function createMcpServer(deps: McpDependencies): McpServer {
             if (!(err instanceof PathIsDirectoryError)) throw err;
             // B2: `path` pointing at a directory is not an error — outline it
             // and record a warning instead of failing.
-            const files = await deps.fsAdapter.listNotes(notePath);
-            if (files.length === 0) {
-              throw new InvalidArgumentError("path (directory has no markdown files)");
-            }
-            if (files.length > 50) {
-              throw new OutlineLimitExceededError("Directory outline limit: max 50 files");
-            }
-            const results = await Promise.all(files.map(async (filePath) => {
-              const source = await deps.fsAdapter.readNote(filePath);
-              return { path: filePath, headings: AstNavigator.findAllHeadings(pipeline.parse(source)) };
-            }));
-            return {
-              directory: notePath,
-              warnings: [`path ${JSON.stringify(notePath)} is a directory; returning its outline (use the directory parameter to scope explicitly)`],
-              files: results,
-            };
+            return buildDirectoryOutline(notePath, [
+              `path ${JSON.stringify(notePath)} is a directory; returning its outline (use the directory parameter to scope explicitly)`,
+            ]);
           }
         }
         case "read": {
@@ -686,8 +803,55 @@ export function createMcpServer(deps: McpDependencies): McpServer {
         }
         case "glob": {
           if (!pattern) throw new InvalidArgumentError("pattern");
-          const files = await deps.fsAdapter.listNotes();
-          return matchGlob(pattern, files);
+          const allFiles = await deps.fsAdapter.listNotes(
+            undefined,
+            includeHidden ? { includeHidden: true } : undefined,
+          );
+
+          let candidates = allFiles;
+          if (directory) {
+            const prefix = `${directory.replace(/\/+$/, "")}/`;
+            candidates = candidates.filter(
+              (p) => p === directory.replace(/\/+$/, "") || p.startsWith(prefix),
+            );
+          }
+
+          const excludePatterns = (
+            exclude === undefined ? [] : Array.isArray(exclude) ? exclude : [exclude]
+          ).map((p) => p.trim()).filter((p) => p.length > 0);
+          if (excludePatterns.length > 0) {
+            candidates = candidates.filter(
+              (p) => !excludePatterns.some(
+                (ex) => matchesIgnorePattern(p, ex) || matchGlob(ex, [p]).length > 0,
+              ),
+            );
+          }
+
+          let matched = matchGlob(pattern, candidates);
+          if ((sort ?? "path") === "mtime") {
+            const withStats = await Promise.all(matched.map(async (p) => {
+              const stat = await deps.fsAdapter.stat(p).catch(() => undefined);
+              return { path: p, modifiedAt: stat?.modifiedAt ?? "" };
+            }));
+            withStats.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
+            matched = withStats.map((entry) => entry.path);
+          }
+
+          const effectiveLimit = limit ?? 100;
+          const effectiveOffset = offset ?? 0;
+          const page = matched.slice(effectiveOffset, effectiveOffset + effectiveLimit);
+          return {
+            pattern,
+            ...(directory !== undefined ? { directory } : {}),
+            ...(excludePatterns.length > 0 ? { exclude: excludePatterns } : {}),
+            sort: sort ?? "path",
+            totalFiles: matched.length,
+            offset: effectiveOffset,
+            limit: effectiveLimit,
+            returned: page.length,
+            truncated: effectiveOffset + page.length < matched.length,
+            files: page,
+          };
         }
         default:
           throw new InvalidArgumentError("action");
@@ -924,6 +1088,11 @@ async function wrapTool<T>(
         errorResponse["hint"] = err.hint;
       }
       if (err instanceof AmbiguousHeadingTargetError) {
+        errorResponse["candidates"] = err.candidates;
+        errorResponse["suggestions"] = err.suggestions;
+      }
+      if (err instanceof HeadingNotFoundError) {
+        errorResponse["suggestions"] = err.suggestions;
         errorResponse["candidates"] = err.candidates;
       }
       return {

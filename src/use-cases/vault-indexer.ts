@@ -9,6 +9,7 @@ import type {
 import { NoteNotFoundError } from "../domain/errors/index.js";
 import { MarkdownChunker } from "./chunker.js";
 import { MarkdownPipeline } from "./markdown-pipeline.js";
+import { isIgnoredPath } from "./vault-ignore.js";
 
 export interface WatcherOptions {
   /** Milliseconds to debounce file-change events. Default: 500. */
@@ -18,6 +19,13 @@ export interface WatcherOptions {
 export interface VaultIndexerOptions {
   /** Meaningful-change threshold that triggers threshold subscribers. Default: 5. */
   threshold?: number;
+  /**
+   * Extra ignore globs (from `VAULT_IGNORE` / `.vaultignore`). Service
+   * directories (dot-prefixed segments, `node_modules`) are always skipped.
+   * Without this, writing into `.stversions` used to enqueue that file and
+   * make it appear in `semantic_search`.
+   */
+  ignorePatterns?: readonly string[];
 }
 
 /** Snapshot of the indexer's current health and operational state. */
@@ -48,6 +56,7 @@ export class VaultIndexer {
   private readonly fs: IFileSystemAdapter;
   private readonly chunker: MarkdownChunker;
   private readonly threshold: number;
+  private readonly ignorePatterns: readonly string[];
   private watcherActive = false;
 
   /** Callbacks invoked after a file is successfully indexed. */
@@ -91,6 +100,12 @@ export class VaultIndexer {
     this.fs = fs;
     this.chunker = new MarkdownChunker(new MarkdownPipeline());
     this.threshold = options?.threshold ?? 5;
+    this.ignorePatterns = options?.ignorePatterns ?? [];
+  }
+
+  /** True when the path is a service-directory artifact and must not be indexed. */
+  private isIgnored(relativePath: string): boolean {
+    return isIgnoredPath(relativePath, this.ignorePatterns);
   }
 
   /** Registers a callback invoked after a file is successfully indexed. */
@@ -136,6 +151,13 @@ export class VaultIndexer {
   // ── Single-file operations ─────────────────────────────────────
 
   async indexFile(relativePath: string): Promise<void> {
+    // Service directories are never note content — skip AND drop any stale
+    // entry left behind by an older version that indexed them.
+    if (this.isIgnored(relativePath)) {
+      await this.store.delete(relativePath).catch(() => {/* best effort */});
+      return;
+    }
+
     const content = await this.fs.readNote(relativePath);
 
     const chunks = this.chunker.chunk(content);
@@ -170,6 +192,11 @@ export class VaultIndexer {
   // ── Bulk indexing ──────────────────────────────────────────────
 
   async indexAll(): Promise<void> {
+    // Purge entries for service directories (`.stversions`, `.trash`, …) that
+    // earlier versions indexed; otherwise they keep showing up in
+    // `semantic_search` through the persisted index.
+    await this.purgeIgnoredEntries();
+
     const files = await this.fs.listNotes();
     for (const file of files) {
       try {
@@ -177,6 +204,25 @@ export class VaultIndexer {
       } catch {
         // Skip files that fail to index and continue with the rest.
       }
+    }
+  }
+
+  /**
+   * Delete index entries whose source file lives in an ignored location.
+   *
+   * Implementations of {@link IVectorStore} expose no enumeration, so the
+   * candidates are discovered from the filesystem via `includeHidden`.
+   */
+  private async purgeIgnoredEntries(): Promise<void> {
+    let allPaths: string[];
+    try {
+      allPaths = await this.fs.listNotes(undefined, { includeHidden: true });
+    } catch {
+      return;
+    }
+    for (const candidate of allPaths) {
+      if (!this.isIgnored(candidate)) continue;
+      await this.store.delete(candidate).catch(() => {/* best effort */});
     }
   }
 
@@ -253,6 +299,7 @@ export class VaultIndexer {
     const handleChange = (absPath: string): void => {
       const relPath = path.relative(this.vaultRoot, absPath);
       if (!relPath.endsWith(".md")) return;
+      if (this.isIgnored(relPath)) return;
 
       // Clear existing debounce timer for this path
       const existing = this.debounceTimers.get(relPath);

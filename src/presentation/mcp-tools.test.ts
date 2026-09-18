@@ -208,7 +208,9 @@ describe("MCP Server — resources and priming", () => {
     });
     const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text);
 
-    expect(parsed.result).toEqual(["daily/2024-01-01.md", "hello.md"]);
+    expect(parsed.result.notes).toEqual(["daily/2024-01-01.md", "hello.md"]);
+    expect(parsed.result.totalFiles).toBe(2);
+    expect(parsed.result.truncated).toBe(false);
     expect(parsed._meta.vault_orientation).toEqual({
       scope: "test vault",
       hint: "Read vault://overview resource for full vault context, search strategy, workflow guidance, and conventions.",
@@ -243,8 +245,10 @@ describe("vault tool", () => {
     const content = result.content as Array<{ type: string; text: string }>;
     const text = content[0]!.text;
     const parsed = JSON.parse(text);
-    expect(parsed.result).toContain("hello.md");
-    expect(parsed.result).toContain("daily/2024-01-01.md");
+    expect(parsed.result.notes).toContain("hello.md");
+    expect(parsed.result.notes).toContain("daily/2024-01-01.md");
+    expect(parsed.result.totalFiles).toBe(2);
+    expect(parsed.result.truncated).toBe(false);
   });
 
   it("reads a note", async () => {
@@ -1115,7 +1119,7 @@ describe("MCP Server — tool schema and description pins", () => {
     expect(parsed.result[0]).toHaveProperty("depth");
   });
 
-  it("view outline with directory returns per-file heading arrays", async () => {
+  it("view outline with directory defaults to a summary tree with counts", async () => {
     await fs.mkdir(`${tmpDir}/dir-outline`, { recursive: true });
     await fs.writeFile(`${tmpDir}/dir-outline/alpha.md`, "# Alpha\n\n## Sub\n\nContent.\n");
     await fs.writeFile(`${tmpDir}/dir-outline/beta.md`, "# Beta\n\nContent.\n");
@@ -1124,13 +1128,59 @@ describe("MCP Server — tool schema and description pins", () => {
       arguments: { action: "outline", directory: "dir-outline" },
     });
     const content = result.content as Array<{ type: string; text: string }>;
-    const parsed = JSON.parse(content[0]!.text) as { result: Array<{ path: string; headings: Array<{ title: string; depth: number }> }> };
-    expect(Array.isArray(parsed.result)).toBe(true);
-    expect(parsed.result).toHaveLength(2);
-    expect(parsed.result[0]).toHaveProperty("path");
-    expect(parsed.result[0]).toHaveProperty("headings");
-    expect(Array.isArray(parsed.result[0]!.headings)).toBe(true);
-    expect(parsed.result[0]!.headings[0]).toHaveProperty("title");
+    const parsed = JSON.parse(content[0]!.text) as {
+      result: { mode: string; totalFiles: number; truncated: boolean; folders: unknown[] };
+    };
+    expect(parsed.result.mode).toBe("summary");
+    expect(parsed.result.totalFiles).toBe(2);
+    expect(parsed.result.truncated).toBe(false);
+    expect(Array.isArray(parsed.result.folders)).toBe(true);
+  });
+
+  it("view outline with mode='files' returns per-file heading arrays", async () => {
+    await fs.mkdir(`${tmpDir}/dir-outline`, { recursive: true });
+    await fs.writeFile(`${tmpDir}/dir-outline/alpha.md`, "# Alpha\n\n## Sub\n\nContent.\n");
+    await fs.writeFile(`${tmpDir}/dir-outline/beta.md`, "# Beta\n\nContent.\n");
+    const result = await client.callTool({
+      name: "view",
+      arguments: { action: "outline", directory: "dir-outline", mode: "files" },
+    });
+    const content = result.content as Array<{ type: string; text: string }>;
+    const parsed = JSON.parse(content[0]!.text) as {
+      result: {
+        mode: string;
+        totalFiles: number;
+        truncated: boolean;
+        files: Array<{ path: string; headings: Array<{ title: string; depth: number }> }>;
+      };
+    };
+    expect(parsed.result.mode).toBe("files");
+    expect(parsed.result.totalFiles).toBe(2);
+    expect(parsed.result.truncated).toBe(false);
+    expect(parsed.result.files).toHaveLength(2);
+    expect(parsed.result.files[0]).toHaveProperty("path");
+    expect(parsed.result.files[0]).toHaveProperty("headings");
+    expect(Array.isArray(parsed.result.files[0]!.headings)).toBe(true);
+    expect(parsed.result.files[0]!.headings[0]).toHaveProperty("title");
+  });
+
+  it("view outline files mode honours limit/offset and reports truncated", async () => {
+    await fs.mkdir(`${tmpDir}/dir-outline-page`, { recursive: true });
+    for (const name of ["a", "b", "c"]) {
+      await fs.writeFile(`${tmpDir}/dir-outline-page/${name}.md`, `# ${name}\n`);
+    }
+    const result = await client.callTool({
+      name: "view",
+      arguments: { action: "outline", directory: "dir-outline-page", mode: "files", limit: 1, offset: 1 },
+    });
+    const content = result.content as Array<{ type: string; text: string }>;
+    const parsed = JSON.parse(content[0]!.text) as {
+      result: { totalFiles: number; returned: number; truncated: boolean; files: Array<{ path: string }> };
+    };
+    expect(parsed.result.totalFiles).toBe(3);
+    expect(parsed.result.returned).toBe(1);
+    expect(parsed.result.truncated).toBe(true);
+    expect(parsed.result.files[0]!.path).toBe("dir-outline-page/b.md");
   });
 
   it("view outline with empty directory returns error", async () => {
@@ -1290,16 +1340,27 @@ describe("view tool — frontmatter YAML errors", () => {
 // ── view tool: directory paths give a clear error with hints ─────
 
 describe("view tool — directory paths give a clear error with hints", () => {
-  it("search with a directory path explains path must be a file", async () => {
+  it("search with a directory path searches inside it and warns (P2-8)", async () => {
+    // Two chunks so the lexical scorer has an IDF signal in this directory.
+    await fs.writeFile(
+      path.join(tmpDir, "daily/2024-01-02.md"),
+      "# Daily Two\n\nAlpha beta gamma delta.\n\n## Transport\n\ntransport options for MCP servers in depth.\n",
+    );
     const result = await client.callTool({
       name: "view",
-      arguments: { action: "search", path: "daily", query: "MCP" },
+      arguments: { action: "search", path: "daily", query: "transport" },
     });
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBeFalsy();
     const text = (result.content as Array<{ type: string; text: string }>)[0]!.text;
-    const parsed = JSON.parse(text) as { error?: string; message?: string };
-    expect(parsed.error).toBe("PATH_IS_DIRECTORY");
-    expect(parsed.message).toContain("global_search");
+    const parsed = JSON.parse(text) as {
+      result: { directory?: string; warnings?: string[]; results: Array<{ filePath: string }> };
+    };
+    expect(parsed.result.directory).toBe("daily");
+    expect(parsed.result.warnings).toHaveLength(1);
+    expect(parsed.result.results.length).toBeGreaterThan(0);
+    expect(
+      parsed.result.results.every((r) => r.filePath.startsWith("daily/")),
+    ).toBe(true);
   });
 
   it("outline with a directory path returns the directory outline with a warning (B2)", async () => {
@@ -1310,10 +1371,12 @@ describe("view tool — directory paths give a clear error with hints", () => {
     expect(result.isError).toBeFalsy();
     const text = (result.content as Array<{ type: string; text: string }>)[0]!.text;
     const parsed = JSON.parse(text) as {
-      result: { directory: string; warnings: string[]; files: unknown[] };
+      result: { directory: string; warnings: string[]; totalFiles: number; mode: string };
     };
     expect(parsed.result.directory).toBe("daily");
     expect(parsed.result.warnings).toHaveLength(1);
+    expect(parsed.result.totalFiles).toBe(1);
+    expect(parsed.result.mode).toBe("summary");
   });
 
   it("read with a directory path is rejected with PATH_IS_DIRECTORY", async () => {
@@ -1544,11 +1607,12 @@ describe("view.outline — directory path fallback (B2)", () => {
 
     expect(result.isError).toBeFalsy();
     const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
-      result: { directory: string; warnings: string[]; files: Array<{ path: string }> };
+      result: { directory: string; warnings: string[]; totalFiles: number; mode: string };
     };
     expect(parsed.result.directory).toBe("outdir");
     expect(parsed.result.warnings).toHaveLength(1);
-    expect(parsed.result.files).toHaveLength(2);
+    expect(parsed.result.totalFiles).toBe(2);
+    expect(parsed.result.mode).toBe("summary");
   });
 });
 
@@ -1715,9 +1779,11 @@ describe("view.glob (B4)", () => {
     });
 
     const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
-      result: string[];
+      result: { files: string[]; totalFiles: number; truncated: boolean };
     };
-    expect(parsed.result).toEqual(["gdir/a.md", "gdir/deep/b.md"]);
+    expect(parsed.result.files).toEqual(["gdir/a.md", "gdir/deep/b.md"]);
+    expect(parsed.result.totalFiles).toBe(2);
+    expect(parsed.result.truncated).toBe(false);
   });
 
   it("errors when pattern is missing", async () => {
@@ -1848,5 +1914,669 @@ describe("edit tool — escaped-character round-trip (D2)", () => {
     const after = await fs.readFile(path.join(tmpDir, "d2.md"), "utf-8");
     expect(after).toContain("Replaced.");
     expect(after).toContain("Tail.");
+  });
+});
+
+// ── P0-1 / P0-2: byte-preserving document edits and verbatim content ──
+
+/** A note remark-stringify would rewrite: dash bullets, a narrow table,
+ *  underscores and an escaped wiki-link. */
+const TRICKY_NOTE = [
+  "---",
+  "title: scratch vault test",
+  "---",
+  "",
+  "- пункт с дефисом",
+  "",
+  "| a | b |",
+  "| --- | --- |",
+  "| 1 | 2 |",
+  "",
+  "Строка с wiki-ссылкой: \\[\\[Agent/_MOC.md]] и подчёркивание send_mail.",
+  "",
+  "- [ ] задача",
+  "",
+].join("\n");
+
+async function editTool(args: Record<string, unknown>): Promise<{
+  isError?: boolean;
+  parsed: { result: Record<string, unknown>; error?: string; message?: string; hint?: string };
+}> {
+  const result = await client.callTool({ name: "edit", arguments: args });
+  const parsed = JSON.parse(
+    (result.content as Array<{ type: string; text: string }>)[0]!.text,
+  );
+  return { ...(result.isError !== undefined ? { isError: result.isError } : {}), parsed };
+}
+
+describe("edit — document append/prepend/replace are byte-preserving (P0-1)", () => {
+  beforeEach(async () => {
+    await fs.writeFile(path.join(tmpDir, "tricky.md"), TRICKY_NOTE);
+  });
+
+  it("append without a heading changes only the inserted lines", async () => {
+    const content = "- новый пункт с подчёркиванием send_mail";
+    const { isError, parsed } = await editTool({
+      path: "tricky.md",
+      operation: "append",
+      content,
+    });
+
+    expect(isError).toBeFalsy();
+    expect(parsed.result.changed).toBe(true);
+
+    const after = await fs.readFile(path.join(tmpDir, "tricky.md"), "utf-8");
+    expect(after).toBe(`${TRICKY_NOTE}\n${content}\n`);
+    expect(after).not.toContain("* пункт с дефисом");
+    expect(after).not.toContain("| --------- |");
+    expect(after).not.toContain("send\\_mail");
+    expect(after).not.toContain("Agent/\\_MOC");
+  });
+
+  it("append dryRun reports a diff of only the added lines", async () => {
+    const content = "Добавленная строка.";
+    const { parsed } = await editTool({
+      path: "tricky.md",
+      operation: "append",
+      content,
+      dryRun: true,
+    });
+
+    const diff = parsed.result.diff as string;
+    const added = diff.split("\n").filter((l) => l.startsWith("+") && !l.startsWith("+++"));
+    const removed = diff.split("\n").filter((l) => l.startsWith("-") && !l.startsWith("---"));
+    expect(added).toHaveLength(2); // the blank separator line + the content
+    expect(removed).toHaveLength(0);
+    expect(added.some((l) => l.includes("Добавленная строка."))).toBe(true);
+  });
+
+  it("prepend inserts after the frontmatter and leaves the rest intact", async () => {
+    const content = "> верхняя вставка";
+    const { isError } = await editTool({
+      path: "tricky.md",
+      operation: "prepend",
+      content,
+    });
+    expect(isError).toBeFalsy();
+
+    const after = await fs.readFile(path.join(tmpDir, "tricky.md"), "utf-8");
+    expect(after.startsWith("---\ntitle: scratch vault test\n---\n")).toBe(true);
+    expect(after).toContain("> верхняя вставка");
+    expect(after).toContain("- пункт с дефисом");
+    expect(after).not.toContain("* пункт с дефисом");
+    expect(after).not.toContain("send\\_mail");
+  });
+
+  it("replace with no heading swaps the body and keeps the frontmatter", async () => {
+    const { isError } = await editTool({
+      path: "tricky.md",
+      operation: "replace",
+      content: "Новое тело.",
+    });
+    expect(isError).toBeFalsy();
+
+    const after = await fs.readFile(path.join(tmpDir, "tricky.md"), "utf-8");
+    expect(after).toBe("---\ntitle: scratch vault test\n---\n\nНовое тело.\n");
+  });
+
+  it("normalize=true still opts into canonical re-serialization", async () => {
+    const { isError } = await editTool({
+      path: "tricky.md",
+      operation: "append",
+      content: "- ещё пункт",
+      normalize: true,
+    });
+    expect(isError).toBeFalsy();
+
+    const after = await fs.readFile(path.join(tmpDir, "tricky.md"), "utf-8");
+    // The canonical path rewrites dash bullets into `*` — the old behaviour,
+    // now only on explicit request.
+    expect(after).toContain("* пункт с дефисом");
+  });
+
+  it("edit tool inputSchema exposes the normalize flag", async () => {
+    const tools = await client.listTools();
+    const edit = tools.tools.find((t) => t.name === "edit");
+    const schema = edit?.inputSchema as { properties?: Record<string, unknown> } | undefined;
+    expect(schema?.properties).toHaveProperty("normalize");
+  });
+});
+
+describe("edit — inserted content is verbatim (P0-2)", () => {
+  it("writes dashes, underscores, pipes and wiki-links exactly as passed", async () => {
+    await fs.writeFile(path.join(tmpDir, "verbatim.md"), "# T\n\n## Section\n\nOld.\n");
+    const content = "- новый пункт с подчёркиванием send_mail\n- [[Agent/_MOC.md]] и * звёздочка\n| a | b |";
+
+    const { isError } = await editTool({
+      path: "verbatim.md",
+      operation: "append",
+      heading: "Section",
+      content,
+    });
+    expect(isError).toBeFalsy();
+
+    const after = await fs.readFile(path.join(tmpDir, "verbatim.md"), "utf-8");
+    expect(after).toContain(content);
+    expect(after).not.toContain("send\\_mail");
+    expect(after).not.toContain("Agent/\\_MOC");
+    expect(after).not.toContain("* новый пункт");
+  });
+});
+
+// ── P1-4: frontmatter object parameter ────────────────────────────
+
+describe("edit — frontmatter_set accepts a frontmatter object (P1-4)", () => {
+  it("works with frontmatter and no content", async () => {
+    await fs.writeFile(path.join(tmpDir, "fm.md"), '---\ntitle: "scratch vault test"\n---\n\nBody.\n');
+
+    const { isError, parsed } = await editTool({
+      path: "fm.md",
+      operation: "frontmatter_set",
+      frontmatter: { status: "draft", owner: "sergey" },
+    });
+
+    expect(isError).toBeFalsy();
+    expect(parsed.result.changed).toBe(true);
+    expect(parsed.result.updatedKeys).toEqual([]);
+    expect(parsed.result.addedKeys).toEqual(["status", "owner"]);
+
+    const after = await fs.readFile(path.join(tmpDir, "fm.md"), "utf-8");
+    expect(after).toBe(
+      '---\ntitle: "scratch vault test"\nstatus: draft\nowner: sergey\n---\n\nBody.\n',
+    );
+  });
+
+  it("still accepts the legacy JSON string in content", async () => {
+    await fs.writeFile(path.join(tmpDir, "fm-legacy.md"), "---\ntitle: Hi\n---\n\nBody.\n");
+
+    const { isError } = await editTool({
+      path: "fm-legacy.md",
+      operation: "frontmatter_set",
+      content: '{"status":"draft"}',
+    });
+    expect(isError).toBeFalsy();
+
+    const after = await fs.readFile(path.join(tmpDir, "fm-legacy.md"), "utf-8");
+    expect(after).toContain("status: draft");
+  });
+
+  it("errors with a usage example when neither frontmatter nor content is given", async () => {
+    await fs.writeFile(path.join(tmpDir, "fm-empty.md"), "---\ntitle: Hi\n---\n\nBody.\n");
+
+    const { isError, parsed } = await editTool({
+      path: "fm-empty.md",
+      operation: "frontmatter_set",
+    });
+
+    expect(isError).toBe(true);
+    expect(parsed.error).toBe("INVALID_ARGUMENT");
+    expect(parsed.hint).toContain("frontmatter");
+  });
+
+  it("explains the payload format when content is not valid JSON", async () => {
+    await fs.writeFile(path.join(tmpDir, "fm-bad.md"), "---\ntitle: Hi\n---\n\nBody.\n");
+
+    const { isError, parsed } = await editTool({
+      path: "fm-bad.md",
+      operation: "frontmatter_set",
+      content: "status: draft",
+    });
+
+    expect(isError).toBe(true);
+    expect(parsed.error).toBe("INVALID_FRONTMATTER_PAYLOAD");
+    expect(parsed.hint).toContain("frontmatter");
+  });
+
+  it("edit tool inputSchema exposes the frontmatter field (single and batch)", async () => {
+    const tools = await client.listTools();
+    const edit = tools.tools.find((t) => t.name === "edit");
+    const schema = edit?.inputSchema as {
+      properties?: Record<string, { items?: { properties?: Record<string, unknown> } }>;
+    } | undefined;
+    expect(schema?.properties).toHaveProperty("frontmatter");
+    expect(schema?.properties?.["operations"]?.items?.properties).toHaveProperty("frontmatter");
+  });
+});
+
+// ── P1-5: frontmatter_set keeps the style of untouched keys ────────
+
+describe("edit — frontmatter_set preserves key style (P1-5)", () => {
+  it("does not strip quotes from other keys", async () => {
+    await fs.writeFile(
+      path.join(tmpDir, "fm-style.md"),
+      '---\ntitle: "scratch vault test"\ntags:\n  - a\n  - b\n---\n\nBody.\n',
+    );
+
+    await editTool({
+      path: "fm-style.md",
+      operation: "frontmatter_set",
+      frontmatter: { status: "draft" },
+    });
+
+    const after = await fs.readFile(path.join(tmpDir, "fm-style.md"), "utf-8");
+    expect(after).toContain('title: "scratch vault test"');
+    expect(after).toContain("tags:\n  - a\n  - b");
+  });
+
+  it("dryRun diff for a single added key touches only that key", async () => {
+    await fs.writeFile(
+      path.join(tmpDir, "fm-diff.md"),
+      "---\ntitle: Hi\ncount: 3\n---\n\nBody.\n",
+    );
+
+    const { parsed } = await editTool({
+      path: "fm-diff.md",
+      operation: "frontmatter_set",
+      frontmatter: { count: 4 },
+      dryRun: true,
+    });
+
+    const diff = parsed.result.diff as string;
+    const changed = diff
+      .split("\n")
+      .filter((l) => /^[+-]/.test(l) && !/^(---|\+\+\+)/.test(l));
+    expect(changed).toEqual(["-count: 3", "+count: 4"]);
+  });
+});
+
+// ── P0-3: service directories never reach listings or search ──────
+
+describe("service directories are excluded everywhere (P0-3)", () => {
+  beforeEach(async () => {
+    for (const dir of [".stversions/Встречи", ".trash", ".obsidian"]) {
+      await fs.mkdir(path.join(tmpDir, dir), { recursive: true });
+    }
+    await fs.writeFile(
+      path.join(tmpDir, ".stversions/Встречи/2026-09-15~20260915-143824.md"),
+      "# Historical\n\nsecret needle content\n",
+    );
+    await fs.writeFile(path.join(tmpDir, ".trash/deleted.md"), "# Deleted\n\nsecret needle content\n");
+  });
+
+  it("vault list does not return service-directory paths", async () => {
+    const result = await client.callTool({ name: "vault", arguments: { action: "list" } });
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      result: { notes: string[] };
+    };
+    expect(parsed.result.notes.some((p) => p.includes(".stversions"))).toBe(false);
+    expect(parsed.result.notes.some((p) => p.includes(".trash"))).toBe(false);
+    expect(parsed.result.notes).toContain("hello.md");
+  });
+
+  it("vault list of an explicit service directory returns nothing", async () => {
+    const result = await client.callTool({
+      name: "vault",
+      arguments: { action: "list", directory: ".stversions/Встречи" },
+    });
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      result: { notes: string[]; totalFiles: number };
+    };
+    expect(parsed.result.totalFiles).toBe(0);
+    expect(parsed.result.notes).toEqual([]);
+  });
+
+  it("vault list includeHidden surfaces them again", async () => {
+    const result = await client.callTool({
+      name: "vault",
+      arguments: { action: "list", includeHidden: true },
+    });
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      result: { notes: string[] };
+    };
+    expect(parsed.result.notes).toContain(".trash/deleted.md");
+  });
+
+  it("view.glob excludes service directories and can include them on request", async () => {
+    const scoped = JSON.parse(
+      ((await client.callTool({
+        name: "view",
+        arguments: { action: "glob", pattern: "**/*.md" },
+      })).content as Array<{ type: string; text: string }>)[0]!.text,
+    ) as { result: { files: string[] } };
+    expect(scoped.result.files.some((p) => p.includes(".stversions"))).toBe(false);
+
+    const hidden = JSON.parse(
+      ((await client.callTool({
+        name: "view",
+        arguments: { action: "glob", pattern: "**/*.md", includeHidden: true },
+      })).content as Array<{ type: string; text: string }>)[0]!.text,
+    ) as { result: { files: string[] } };
+    expect(hidden.result.files.some((p) => p.includes(".stversions"))).toBe(true);
+  });
+
+  it("view.search does not return service-directory notes", async () => {
+    const parsed = JSON.parse(
+      ((await client.callTool({
+        name: "view",
+        arguments: { action: "search", query: "needle" },
+      })).content as Array<{ type: string; text: string }>)[0]!.text,
+    ) as { result: Array<{ filePath: string }> };
+    expect(parsed.result.some((r) => r.filePath.includes(".stversions"))).toBe(false);
+    expect(parsed.result.some((r) => r.filePath.includes(".trash"))).toBe(false);
+  });
+
+  it("vault overview and vault list agree on the file count", async () => {
+    const list = JSON.parse(
+      ((await client.callTool({ name: "vault", arguments: { action: "list" } })).content as Array<{ type: string; text: string }>)[0]!.text,
+    ) as { result: { totalFiles: number } };
+    const overview = JSON.parse(
+      ((await client.callTool({ name: "system", arguments: { action: "overview" } })).content as Array<{ type: string; text: string }>)[0]!.text,
+    ) as { result: { totalFiles: number } };
+    expect(overview.result.totalFiles).toBe(list.result.totalFiles);
+  });
+});
+
+// ── P1-7: heading depth tolerance ─────────────────────────────────
+
+describe("edit — heading depth tolerance (P1-7)", () => {
+  beforeEach(async () => {
+    await fs.writeFile(
+      path.join(tmpDir, "depths.md"),
+      "# Тест\n\nH1 body.\n\n## Раздел\n\nH2 body.\n\n### Глубоко\n\nH3 body.\n",
+    );
+  });
+
+  it("edits an H1 without an explicit headingDepth and reports resolvedDepth", async () => {
+    const { isError, parsed } = await editTool({
+      path: "depths.md",
+      operation: "append",
+      heading: "Тест",
+      content: "Добавлено в H1.",
+    });
+
+    expect(isError).toBeFalsy();
+    expect(parsed.result.resolvedDepth).toBe(1);
+    expect(parsed.result.warnings).toBeDefined();
+    expect((parsed.result.warnings as string[])[0]).toMatch(/headingDepth 1/);
+
+    const after = await fs.readFile(path.join(tmpDir, "depths.md"), "utf-8");
+    expect(after).toContain("# Тест");
+    expect(after).toContain("Добавлено в H1.");
+    // The H1 section spans the whole document, so nothing else was touched.
+    expect(after).toContain("H1 body.");
+    expect(after).toContain("H2 body.");
+    expect(after).toContain("H3 body.");
+  });
+
+  it("replace on an H1 swaps the whole H1 section body", async () => {
+    const { isError } = await editTool({
+      path: "depths.md",
+      operation: "replace",
+      heading: "Тест",
+      content: "Новое тело H1.",
+    });
+
+    expect(isError).toBeFalsy();
+    const after = await fs.readFile(path.join(tmpDir, "depths.md"), "utf-8");
+    expect(after).toContain("# Тест");
+    expect(after).toContain("Новое тело H1.");
+    expect(after).not.toContain("H1 body.");
+  });
+
+  it("edits an H3 without an explicit headingDepth", async () => {
+    const { isError, parsed } = await editTool({
+      path: "depths.md",
+      operation: "append",
+      heading: "Глубоко",
+      content: "Добавлено в H3.",
+    });
+
+    expect(isError).toBeFalsy();
+    expect(parsed.result.resolvedDepth).toBe(3);
+  });
+
+  it("does not report resolvedDepth when the heading is at depth 2", async () => {
+    const { isError, parsed } = await editTool({
+      path: "depths.md",
+      operation: "append",
+      heading: "Раздел",
+      content: "Добавлено в H2.",
+    });
+
+    expect(isError).toBeFalsy();
+    expect(parsed.result.resolvedDepth).toBeUndefined();
+  });
+
+  it("a genuinely missing heading reports HEADING_NOT_FOUND with suggestions", async () => {
+    const { isError, parsed } = await editTool({
+      path: "depths.md",
+      operation: "append",
+      heading: "Совершенно другой заголовок",
+      content: "x",
+    });
+
+    expect(isError).toBe(true);
+    expect(parsed.error).toBe("HEADING_NOT_FOUND");
+    expect(parsed.hint).toContain("view.outline");
+    expect(Array.isArray((parsed as unknown as { suggestions?: string[] }).suggestions)).toBe(true);
+  });
+});
+
+// ── P1-6 / P2-9: outline and listing limits ───────────────────────
+
+describe("outline and listings report totals and truncation (P1-6, P2-9)", () => {
+  beforeEach(async () => {
+    await fs.mkdir(path.join(tmpDir, "many", "sub"), { recursive: true });
+    for (let i = 0; i < 60; i++) {
+      const name = `${String(i).padStart(2, "0")}.md`;
+      await fs.writeFile(path.join(tmpDir, "many", name), `# Note ${i}\n`);
+    }
+    await fs.writeFile(path.join(tmpDir, "many/sub/one.md"), "# Sub\n");
+  });
+
+  it("outline on a large directory returns a summary instead of failing", async () => {
+    const parsed = JSON.parse(
+      ((await client.callTool({
+        name: "view",
+        arguments: { action: "outline", directory: "many" },
+      })).content as Array<{ type: string; text: string }>)[0]!.text,
+    ) as { result: { mode: string; totalFiles: number; folders: Array<{ name: string; fileCount: number }> } };
+
+    expect(parsed.result.mode).toBe("summary");
+    expect(parsed.result.totalFiles).toBe(61);
+    const sub = parsed.result.folders.find((f) => f.name === "sub")!;
+    expect(sub.fileCount).toBe(1);
+  });
+
+  it("outline mode='files' pages the per-file listing and flags truncation", async () => {
+    const parsed = JSON.parse(
+      ((await client.callTool({
+        name: "view",
+        arguments: { action: "outline", directory: "many", mode: "files" },
+      })).content as Array<{ type: string; text: string }>)[0]!.text,
+    ) as { result: { totalFiles: number; returned: number; truncated: boolean; limit: number } };
+
+    expect(parsed.result.totalFiles).toBe(61);
+    expect(parsed.result.limit).toBe(50);
+    expect(parsed.result.returned).toBe(50);
+    expect(parsed.result.truncated).toBe(true);
+  });
+
+  it("outline mode='files' can reach the full listing through limit", async () => {
+    const parsed = JSON.parse(
+      ((await client.callTool({
+        name: "view",
+        arguments: { action: "outline", directory: "many", mode: "files", limit: 200 },
+      })).content as Array<{ type: string; text: string }>)[0]!.text,
+    ) as { result: { totalFiles: number; returned: number; truncated: boolean } };
+
+    expect(parsed.result.returned).toBe(61);
+    expect(parsed.result.truncated).toBe(false);
+  });
+
+  it("vault list is capped by limit and reports totalFiles/truncated", async () => {
+    const parsed = JSON.parse(
+      ((await client.callTool({
+        name: "vault",
+        arguments: { action: "list", limit: 2 },
+      })).content as Array<{ type: string; text: string }>)[0]!.text,
+    ) as { result: { notes: string[]; totalFiles: number; truncated: boolean; returned: number } };
+
+    expect(parsed.result.notes).toHaveLength(2);
+    expect(parsed.result.returned).toBe(2);
+    expect(parsed.result.truncated).toBe(true);
+    expect(parsed.result.totalFiles).toBeGreaterThan(2);
+  });
+
+  it("vault list mode='tree' returns a directory summary with counts", async () => {
+    const parsed = JSON.parse(
+      ((await client.callTool({
+        name: "vault",
+        arguments: { action: "list", mode: "tree" },
+      })).content as Array<{ type: string; text: string }>)[0]!.text,
+    ) as { result: { mode: string; totalFiles: number; folders: Array<{ name: string; totalFiles: number }> } };
+
+    expect(parsed.result.mode).toBe("tree");
+    const many = parsed.result.folders.find((f) => f.name === "many")!;
+    expect(many.totalFiles).toBe(61);
+  });
+
+  it("view.glob supports exclude, sort and limit", async () => {
+    const parsed = JSON.parse(
+      ((await client.callTool({
+        name: "view",
+        arguments: { action: "glob", pattern: "**/*.md", exclude: "many/**", sort: "path" },
+      })).content as Array<{ type: string; text: string }>)[0]!.text,
+    ) as { result: { files: string[]; totalFiles: number; truncated: boolean; exclude: string[] } };
+
+    expect(parsed.result.exclude).toEqual(["many/**"]);
+    expect(parsed.result.files.some((p) => p.startsWith("many/"))).toBe(false);
+    expect(parsed.result.totalFiles).toBe(parsed.result.files.length);
+    expect(parsed.result.truncated).toBe(false);
+
+    const limited = JSON.parse(
+      ((await client.callTool({
+        name: "view",
+        arguments: { action: "glob", pattern: "many/**/*.md", limit: 5 },
+      })).content as Array<{ type: string; text: string }>)[0]!.text,
+    ) as { result: { files: string[]; totalFiles: number; truncated: boolean } };
+    expect(limited.result.files).toHaveLength(5);
+    expect(limited.result.truncated).toBe(true);
+    expect(limited.result.totalFiles).toBe(61);
+  });
+
+  it("view.glob accepts an array of exclude patterns", async () => {
+    const parsed = JSON.parse(
+      ((await client.callTool({
+        name: "view",
+        arguments: { action: "glob", pattern: "**/*.md", exclude: ["many/**", "daily/**"] },
+      })).content as Array<{ type: string; text: string }>)[0]!.text,
+    ) as { result: { files: string[]; exclude: string[] } };
+
+    expect(parsed.result.exclude).toEqual(["many/**", "daily/**"]);
+    expect(parsed.result.files.some((p) => p.startsWith("many/") || p.startsWith("daily/"))).toBe(false);
+    expect(parsed.result.files).toContain("hello.md");
+  });
+});
+
+// ── P2-10: batch sanity warnings and delete pruning ───────────────
+
+describe("P2-10 — batch sanity warnings and pruneEmptyDirs", () => {
+  it("batch operations surface content-sanity warnings like single edits", async () => {
+    await fs.writeFile(path.join(tmpDir, "batch-sanity.md"), "# T\n\nBody.\n");
+
+    const result = await client.callTool({
+      name: "edit",
+      arguments: {
+        operations: [
+          {
+            path: "batch-sanity.md",
+            operation: "append",
+            content: "escaped underscore \\_x and entity &#x6E;",
+          },
+        ],
+      },
+    });
+
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      result: { results: Array<{ warnings?: string[] }> };
+    };
+    expect(parsed.result.results[0]!.warnings?.length).toBeGreaterThan(0);
+  });
+
+  it("batch frontmatter_set accepts a frontmatter object without content", async () => {
+    await fs.writeFile(path.join(tmpDir, "batch-fm.md"), "---\ntitle: Hi\n---\n\nBody.\n");
+
+    const result = await client.callTool({
+      name: "edit",
+      arguments: {
+        operations: [
+          { path: "batch-fm.md", operation: "frontmatter_set", frontmatter: { status: "draft" } },
+        ],
+      },
+    });
+
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      result: { totalSucceeded: number };
+    };
+    expect(parsed.result.totalSucceeded).toBe(1);
+    const after = await fs.readFile(path.join(tmpDir, "batch-fm.md"), "utf-8");
+    expect(after).toContain("status: draft");
+  });
+
+  it("batch append is byte-preserving too", async () => {
+    await fs.writeFile(path.join(tmpDir, "batch-bytes.md"), "# T\n\n- dash\n\nsend_mail\n");
+
+    await client.callTool({
+      name: "edit",
+      arguments: {
+        operations: [{ path: "batch-bytes.md", operation: "append", content: "- added" }],
+      },
+    });
+
+    const after = await fs.readFile(path.join(tmpDir, "batch-bytes.md"), "utf-8");
+    expect(after).toBe("# T\n\n- dash\n\nsend_mail\n\n- added\n");
+  });
+
+  it("vault delete with pruneEmptyDirs removes the emptied folder", async () => {
+    await fs.mkdir(path.join(tmpDir, "_scratch-nodir"), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, "_scratch-nodir/note.md"), "x\n");
+
+    await client.callTool({
+      name: "vault",
+      arguments: { action: "delete", path: "_scratch-nodir/note.md", pruneEmptyDirs: true },
+    });
+
+    await expect(fs.stat(path.join(tmpDir, "_scratch-nodir"))).rejects.toThrow();
+  });
+
+  it("vault delete without pruneEmptyDirs keeps the folder", async () => {
+    await fs.mkdir(path.join(tmpDir, "_keep-nodir"), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, "_keep-nodir/note.md"), "x\n");
+
+    await client.callTool({
+      name: "vault",
+      arguments: { action: "delete", path: "_keep-nodir/note.md" },
+    });
+
+    await expect(fs.stat(path.join(tmpDir, "_keep-nodir"))).resolves.toBeDefined();
+  });
+});
+
+// ── P0-3: semantic_search never returns service-directory notes ───
+
+describe("view.semantic_search excludes service directories (P0-3)", () => {
+  it("filters a stale service-directory entry from the vector store", async () => {
+    const vector = Array.from({ length: 3 }, (_, i) => (i === 0 ? 1 : 0));
+    await deps.vectorStore.upsert({
+      docPath: ".stversions/Встречи/2026-09-07~20260907-131234.md",
+      chunks: [{ chunkId: "root", vector, text: "contrast management secret", headingPath: [] }],
+    });
+    await deps.vectorStore.upsert({
+      docPath: "Встречи/2026-09-07.md",
+      chunks: [{ chunkId: "root", vector, text: "contract management notes", headingPath: [] }],
+    });
+
+    const result = await client.callTool({
+      name: "view",
+      arguments: { action: "semantic_search", query: "contract management" },
+    });
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      result: Array<{ docPath: string }>;
+    };
+
+    expect(parsed.result.length).toBeGreaterThan(0);
+    expect(parsed.result.some((r) => r.docPath.includes(".stversions"))).toBe(false);
+    expect(parsed.result.some((r) => r.docPath === "Встречи/2026-09-07.md")).toBe(true);
   });
 });

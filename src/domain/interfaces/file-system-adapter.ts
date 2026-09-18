@@ -9,8 +9,11 @@ export interface IFileSystemAdapter {
    * List all `.md` note paths under the given directory (recursive).
    * Returns vault-relative paths sorted alphabetically.
    * An empty `directory` means the vault root.
+   *
+   * Service directories are excluded unless `options.includeHidden` is set —
+   * see `src/use-cases/vault-ignore.ts`.
    */
-  listNotes(directory?: string): Promise<string[]>;
+  listNotes(directory?: string, options?: ListNotesOptions): Promise<string[]>;
 
   /**
    * Read the full UTF-8 content of a note.
@@ -31,9 +34,11 @@ export interface IFileSystemAdapter {
 
   /**
    * Delete a note from the vault.
+   * @param options.pruneEmptyDirs When true, remove parent directories that
+   *   became empty (never the vault root itself).
    * @throws NoteNotFoundError if the file does not exist.
    */
-  deleteNote(notePath: string): Promise<void>;
+  deleteNote(notePath: string, options?: DeleteNoteOptions): Promise<void>;
 
   /**
    * Check whether a note exists.
@@ -45,6 +50,22 @@ export interface IFileSystemAdapter {
    * @throws NoteNotFoundError if the file does not exist.
    */
   stat(notePath: string): Promise<NoteStat>;
+}
+
+/** Options for {@link IFileSystemAdapter.listNotes}. */
+export interface ListNotesOptions {
+  /**
+   * Include paths that are ignored by default: any dot-prefixed path segment
+   * (`.obsidian`, `.trash`, `.stversions`, …) and everything matching the
+   * configured `VAULT_IGNORE` / `.vaultignore` patterns.
+   */
+  includeHidden?: boolean;
+}
+
+/** Options for {@link IFileSystemAdapter.deleteNote}. */
+export interface DeleteNoteOptions {
+  /** Remove parent directories that became empty after the delete. */
+  pruneEmptyDirs?: boolean;
 }
 
 export interface NoteStat {

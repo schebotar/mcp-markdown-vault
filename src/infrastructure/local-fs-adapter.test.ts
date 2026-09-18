@@ -213,6 +213,95 @@ describe("listNotes", () => {
   });
 });
 
+// ── listNotes: service-directory ignore (P0-3) ────────────────────
+
+describe("listNotes — service directories are excluded", () => {
+  async function seedServiceDirs(): Promise<void> {
+    for (const dir of [".stversions/Встречи", ".trash", ".obsidian/templates", "node_modules/pkg"]) {
+      await fs.mkdir(path.join(vaultDir, dir), { recursive: true });
+    }
+    await fs.writeFile(path.join(vaultDir, "real.md"), "# Real\n");
+    await fs.writeFile(path.join(vaultDir, ".stversions/Встречи/2026-09-15~20260915-143824.md"), "old\n");
+    await fs.writeFile(path.join(vaultDir, ".trash/deleted.md"), "gone\n");
+    await fs.writeFile(path.join(vaultDir, ".obsidian/templates/t.md"), "tpl\n");
+    await fs.writeFile(path.join(vaultDir, "node_modules/pkg/readme.md"), "pkg\n");
+    await fs.writeFile(path.join(vaultDir, ".hidden.md"), "hidden\n");
+  }
+
+  it("skips dot-directories, node_modules and dot-files", async () => {
+    await seedServiceDirs();
+
+    expect(await adapter.listNotes()).toEqual(["real.md"]);
+  });
+
+  it("skips them even when the requested directory is a service directory", async () => {
+    await seedServiceDirs();
+
+    expect(await adapter.listNotes(".stversions/Встречи")).toEqual([]);
+  });
+
+  it("includeHidden surfaces them again", async () => {
+    await seedServiceDirs();
+
+    const all = await adapter.listNotes(undefined, { includeHidden: true });
+    expect(all).toContain("real.md");
+    expect(all).toContain(".trash/deleted.md");
+    expect(all).toContain("node_modules/pkg/readme.md");
+    expect(all).toContain(".hidden.md");
+  });
+
+  it("honours extra ignore patterns from VAULT_IGNORE/.vaultignore", async () => {
+    await fs.mkdir(path.join(vaultDir, "Archive"), { recursive: true });
+    await fs.writeFile(path.join(vaultDir, "Archive/old.md"), "old\n");
+    await fs.writeFile(path.join(vaultDir, "keep.md"), "keep\n");
+    const scoped = await LocalFileSystemAdapter.create(vaultDir, {
+      ignorePatterns: ["Archive/**"],
+    });
+
+    expect(await scoped.listNotes()).toEqual(["keep.md"]);
+  });
+});
+
+// ── deleteNote: pruneEmptyDirs (P2-10) ────────────────────────────
+
+describe("deleteNote — pruneEmptyDirs", () => {
+  it("leaves the empty parent directory by default", async () => {
+    await fs.mkdir(path.join(vaultDir, "_scratch-nodir"), { recursive: true });
+    await fs.writeFile(path.join(vaultDir, "_scratch-nodir/note.md"), "x\n");
+
+    await adapter.deleteNote("_scratch-nodir/note.md");
+
+    await expect(fs.stat(path.join(vaultDir, "_scratch-nodir"))).resolves.toBeDefined();
+  });
+
+  it("removes the emptied parent directory when asked", async () => {
+    await fs.mkdir(path.join(vaultDir, "_scratch-nodir"), { recursive: true });
+    await fs.writeFile(path.join(vaultDir, "_scratch-nodir/note.md"), "x\n");
+
+    await adapter.deleteNote("_scratch-nodir/note.md", { pruneEmptyDirs: true });
+
+    await expect(fs.stat(path.join(vaultDir, "_scratch-nodir"))).rejects.toThrow();
+  });
+
+  it("never removes the vault root", async () => {
+    await fs.writeFile(path.join(vaultDir, "root-note.md"), "x\n");
+
+    await adapter.deleteNote("root-note.md", { pruneEmptyDirs: true });
+
+    await expect(fs.stat(vaultDir)).resolves.toBeDefined();
+  });
+
+  it("keeps parents that still hold other files", async () => {
+    await fs.mkdir(path.join(vaultDir, "dir"), { recursive: true });
+    await fs.writeFile(path.join(vaultDir, "dir/a.md"), "a\n");
+    await fs.writeFile(path.join(vaultDir, "dir/b.md"), "b\n");
+
+    await adapter.deleteNote("dir/a.md", { pruneEmptyDirs: true });
+
+    await expect(fs.stat(path.join(vaultDir, "dir"))).resolves.toBeDefined();
+  });
+});
+
 describe("LocalFileSystemAdapter — symlink containment", () => {
   let vaultDir: string;
   let outsideDir: string;

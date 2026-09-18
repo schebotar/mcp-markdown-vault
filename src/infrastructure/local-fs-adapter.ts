@@ -2,7 +2,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import type {
+  DeleteNoteOptions,
   IFileSystemAdapter,
+  ListNotesOptions,
   NoteStat,
 } from "../domain/interfaces/index.js";
 import {
@@ -13,17 +15,36 @@ import {
   PathIsDirectoryError,
 } from "../domain/errors/index.js";
 import { SafePath } from "../domain/value-objects/index.js";
+import { isIgnoredPath } from "../use-cases/vault-ignore.js";
+
+/** Construction options for {@link LocalFileSystemAdapter}. */
+export interface LocalFileSystemAdapterOptions {
+  /**
+   * Extra glob patterns whose matches are excluded from note listings
+   * (from `VAULT_IGNORE` and `.vaultignore`).
+   */
+  ignorePatterns?: readonly string[];
+}
 
 export class LocalFileSystemAdapter implements IFileSystemAdapter {
   private readonly vaultRoot: string;
   private readonly canonicalRoot: string;
+  private readonly ignorePatterns: readonly string[];
 
-  private constructor(vaultRoot: string, canonicalRoot: string) {
+  private constructor(
+    vaultRoot: string,
+    canonicalRoot: string,
+    ignorePatterns: readonly string[],
+  ) {
     this.vaultRoot = vaultRoot;
     this.canonicalRoot = canonicalRoot;
+    this.ignorePatterns = ignorePatterns;
   }
 
-  static async create(vaultRoot: string): Promise<LocalFileSystemAdapter> {
+  static async create(
+    vaultRoot: string,
+    options?: LocalFileSystemAdapterOptions,
+  ): Promise<LocalFileSystemAdapter> {
     const resolved = path.resolve(vaultRoot);
     try {
       const stat = await fs.stat(resolved);
@@ -35,7 +56,11 @@ export class LocalFileSystemAdapter implements IFileSystemAdapter {
       throw new VaultNotFoundError(vaultRoot);
     }
     const canonicalRoot = await fs.realpath(resolved);
-    return new LocalFileSystemAdapter(resolved, canonicalRoot);
+    return new LocalFileSystemAdapter(
+      resolved,
+      canonicalRoot,
+      options?.ignorePatterns ?? [],
+    );
   }
 
   private async assertContained(absPath: string): Promise<void> {
@@ -69,7 +94,10 @@ export class LocalFileSystemAdapter implements IFileSystemAdapter {
     }
   }
 
-  async listNotes(directory?: string): Promise<string[]> {
+  async listNotes(
+    directory?: string,
+    options?: ListNotesOptions,
+  ): Promise<string[]> {
     const target = directory
       ? SafePath.createDirectory(this.vaultRoot, directory)
       : SafePath.createDirectory(this.vaultRoot, "");
@@ -87,6 +115,7 @@ export class LocalFileSystemAdapter implements IFileSystemAdapter {
       withFileTypes: true,
     });
 
+    const includeHidden = options?.includeHidden ?? false;
     const mdFiles: string[] = [];
     for (const entry of entries) {
       if (!entry.isFile()) continue;
@@ -99,6 +128,11 @@ export class LocalFileSystemAdapter implements IFileSystemAdapter {
         (entry as unknown as { path: string }).path;
       const fullPath = path.join(entryDir, entry.name);
       const relative = path.relative(this.vaultRoot, fullPath);
+
+      // Service directories (.obsidian, .trash, .stversions, …) and configured
+      // patterns are excluded here so every consumer agrees on the note set.
+      if (isIgnoredPath(relative, this.ignorePatterns, includeHidden)) continue;
+
       mdFiles.push(relative);
     }
 
@@ -187,13 +221,42 @@ export class LocalFileSystemAdapter implements IFileSystemAdapter {
     }
   }
 
-  async deleteNote(notePath: string): Promise<void> {
+  async deleteNote(
+    notePath: string,
+    options?: DeleteNoteOptions,
+  ): Promise<void> {
     const safePath = SafePath.create(this.vaultRoot, notePath);
     await this.assertContained(safePath.absolute);
     try {
       await fs.unlink(safePath.absolute);
     } catch {
       throw new NoteNotFoundError(notePath);
+    }
+    if (options?.pruneEmptyDirs) {
+      await this.pruneEmptyParents(path.dirname(safePath.absolute));
+    }
+  }
+
+  /** Remove parent directories that became empty, stopping at the vault root. */
+  private async pruneEmptyParents(startDir: string): Promise<void> {
+    let current = startDir;
+    while (
+      current.startsWith(this.vaultRoot + path.sep) &&
+      current !== this.vaultRoot
+    ) {
+      let entries: string[];
+      try {
+        entries = await fs.readdir(current);
+      } catch {
+        return;
+      }
+      if (entries.length > 0) return;
+      try {
+        await fs.rmdir(current);
+      } catch {
+        return;
+      }
+      current = path.dirname(current);
     }
   }
 

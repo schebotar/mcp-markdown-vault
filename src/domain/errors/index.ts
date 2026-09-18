@@ -76,13 +76,55 @@ export class AstPatchError extends DomainError {
   }
 }
 
+/** A heading that exists in the document, reported when a target misses. */
+export interface HeadingCandidate {
+  title: string;
+  depth: number;
+  index: number;
+}
+
+function describeCandidates(
+  candidates: ReadonlyArray<HeadingCandidate>,
+): string {
+  return candidates
+    .map((c) => `"${c.title}" (headingDepth: ${c.depth})`)
+    .join(", ");
+}
+
 export class HeadingNotFoundError extends DomainError {
-  constructor(title: string, depth: number) {
+  /** Fuzzy suggestions, formatted as `"Title" (headingDepth: N)`. */
+  public readonly suggestions: readonly string[];
+
+  /** Existing headings that matched the title at a different depth. */
+  public readonly candidates: ReadonlyArray<HeadingCandidate>;
+
+  constructor(
+    title: string,
+    depth: number,
+    options?: {
+      suggestions?: readonly string[] | undefined;
+      candidates?: ReadonlyArray<HeadingCandidate> | undefined;
+    },
+  ) {
+    const suggestions = options?.suggestions ?? [];
+    const candidates = options?.candidates ?? [];
+
+    let message = `Heading not found: "${title}" at depth ${depth}`;
+    if (candidates.length > 0) {
+      message += `. The heading exists at another depth: ${describeCandidates(candidates)}`;
+    } else if (suggestions.length > 0) {
+      message += `. Did you mean: ${suggestions.map((s) => JSON.stringify(s)).join(", ")}?`;
+    }
+
     super(
       "HEADING_NOT_FOUND",
-      `Heading not found: "${title}" at depth ${depth}`,
+      message,
+      undefined,
+      "Run view.outline (or view.outline with directory) to list available headings with their depth, then pass headingDepth explicitly.",
     );
     this.name = "HeadingNotFoundError";
+    this.suggestions = suggestions;
+    this.candidates = candidates;
   }
 }
 
@@ -125,6 +167,9 @@ export class InvalidFrontmatterPayloadError extends DomainError {
     super(
       "INVALID_FRONTMATTER_PAYLOAD",
       `Invalid frontmatter payload: ${detail}`,
+      undefined,
+      'Pass frontmatter as a JSON object, e.g. edit { operation: "frontmatter_set", frontmatter: { "status": "draft" } }. ' +
+        'Legacy form: content: \'{"status":"draft"}\' (a JSON object string, not YAML).',
     );
     this.name = "InvalidFrontmatterPayloadError";
   }
@@ -223,22 +268,28 @@ export class InvalidConfigError extends DomainError {
 
 /** Thrown when a heading target is ambiguous due to duplicate headings. */
 export class AmbiguousHeadingTargetError extends DomainError {
-  public readonly candidates: ReadonlyArray<{ title: string; depth: number; index: number }>;
+  public readonly candidates: ReadonlyArray<HeadingCandidate>;
+
+  /** Fuzzy suggestions, formatted as `"Title" (headingDepth: N)`. */
+  public readonly suggestions: readonly string[];
 
   constructor(
     title: string,
     depth: number,
-    candidates: ReadonlyArray<{ title: string; depth: number; index: number }>,
+    candidates: ReadonlyArray<HeadingCandidate>,
+    suggestions: readonly string[] = [],
   ) {
     super(
       "AMBIGUOUS_HEADING_TARGET",
-      `Ambiguous heading target: "${title}" at depth ${depth} matches ${candidates.length} headings. ` +
+      `Ambiguous heading target: "${title}" matched ${candidates.length} headings ` +
+        `(requested depth ${depth}): ${describeCandidates(candidates)}. ` +
         `Use blockId targeting to disambiguate. ` +
         `Add block IDs like "^my-id" to the relevant heading sections first, ` +
         `then reference via blockId instead of heading text.`,
     );
     this.name = "AmbiguousHeadingTargetError";
     this.candidates = candidates;
+    this.suggestions = suggestions;
   }
 }
 

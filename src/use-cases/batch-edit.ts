@@ -1,20 +1,19 @@
-import yaml from "js-yaml";
 import type { IFileSystemAdapter } from "../domain/interfaces/file-system-adapter.js";
 import type { IDiffService } from "../domain/interfaces/diff-service.js";
 import type { IMarkdownRepository } from "../domain/interfaces/markdown-repository.js";
-import { BatchLimitExceededError, AmbiguousHeadingTargetError, InvalidArgumentError, InvalidFrontmatterYamlError, FreeformEditError } from "../domain/errors/index.js";
+import { BatchLimitExceededError, InvalidArgumentError, FreeformEditError } from "../domain/errors/index.js";
 import type { MarkdownPipeline } from "./markdown-pipeline.js";
-import { AstNavigator } from "./ast-navigation.js";
 import { AstPatcher } from "./ast-patcher.js";
 import type { PatchOperation } from "./ast-patcher.js";
 import { TextPatcher } from "./text-patcher.js";
-import { FuzzyMatcher } from "./fuzzy-match.js";
+import { HeadingResolver } from "./heading-target.js";
 import { FreeformEditor } from "./freeform-editor.js";
 import { DryRunEditor } from "./dry-run-edit.js";
 import { parseFrontmatterPayload } from "./frontmatter.js";
+import { checkContentSanity } from "./content-sanity.js";
 import { fingerprintNote } from "./file-fingerprint.js";
 import { buildStringNotFoundMessage, logStringReplaceFailure } from "./string-not-found.js";
-import { extractFrontmatterRaw, replaceFrontmatterBlock } from "./frontmatter-surgery.js";
+import { mergeFrontmatterPreservingStyle } from "./frontmatter-surgery.js";
 
 const MAX_OPERATIONS = 50;
 
@@ -22,7 +21,8 @@ const MAX_OPERATIONS = 50;
 export interface EditOperation {
   path: string;
   operation: "append" | "prepend" | "replace" | "delete" | "line_replace" | "string_replace" | "frontmatter_set";
-  content: string;
+  content?: string | undefined;
+  frontmatter?: Record<string, unknown> | undefined;
   heading?: string | undefined;
   headingDepth?: number | undefined;
   blockId?: string | undefined;
@@ -32,6 +32,7 @@ export interface EditOperation {
   searchText?: string | undefined;
   replaceAll?: boolean | undefined;
   replaceMode?: "body" | "section" | undefined;
+  normalize?: boolean | undefined;
 }
 
 /** Batch edit request. */
@@ -86,14 +87,28 @@ export class BatchEditService {
    * silently write to disk. Runtime problems (file missing, search string not
    * found) are handled per-operation with `stoppedAtIndex`.
    *
-   * `content` is required for every operation EXCEPT `delete`. An empty string
-   * is a legitimate value (e.g. removing a block via string_replace).
+   * `content` is required for every operation EXCEPT `delete` and
+   * `frontmatter_set` (which also accepts a `frontmatter` object). An empty
+   * string is a legitimate value (e.g. removing a block via string_replace).
    */
   private static assertValidOperation(op: EditOperation): void {
     if (typeof op.path !== "string" || op.path.length === 0) {
       throw new InvalidArgumentError("path");
     }
     if (op.operation === "delete") {
+      return;
+    }
+    if (op.operation === "frontmatter_set") {
+      if (op.frontmatter === undefined) {
+        if (typeof op.content !== "string") {
+          throw new InvalidArgumentError(
+            "frontmatter (or legacy JSON in content)",
+            'Use frontmatter: { "status": "draft" }, or the legacy content: \'{"status":"draft"}\'.',
+          );
+        }
+        // Throws InvalidFrontmatterPayloadError when content is not valid JSON.
+        parseFrontmatterPayload(op.content);
+      }
       return;
     }
     if (typeof op.content !== "string") {
@@ -110,9 +125,6 @@ export class BatchEditService {
       ) {
         throw new InvalidArgumentError("startLine/endLine");
       }
-    } else if (op.operation === "frontmatter_set") {
-      // Throws InvalidFrontmatterPayloadError when content is not valid JSON.
-      parseFrontmatterPayload(op.content);
     }
   }
 
@@ -155,6 +167,7 @@ export class BatchEditService {
           status: "success",
           diff: editResult.diff,
           changed: editResult.changed,
+          ...(editResult.warnings.length > 0 ? { warnings: editResult.warnings } : {}),
         });
         totalSucceeded++;
       } catch (err) {
@@ -185,8 +198,15 @@ export class BatchEditService {
   private async executeSingle(
     op: EditOperation,
     dryRun: boolean,
-  ): Promise<{ message: string; diff?: string | undefined; changed?: boolean | undefined }> {
+  ): Promise<{ message: string; diff?: string | undefined; changed?: boolean | undefined; warnings: string[] }> {
     const source = await this.fsAdapter.readNote(op.path);
+
+    // The same sanity heuristic the single-edit path applies — batch
+    // operations used to skip it entirely.
+    const warnings: string[] = [];
+    if (op.operation !== "frontmatter_set" && op.operation !== "delete" && typeof op.content === "string") {
+      warnings.push(...checkContentSanity(op.content));
+    }
 
     const withChanged = async (newContent: string, label: string) => {
       const editResult = await this.dryRunEditor.execute({
@@ -196,7 +216,7 @@ export class BatchEditService {
         dryRun,
         operationLabel: label,
       });
-      return { ...editResult, changed: source !== newContent };
+      return { ...editResult, changed: source !== newContent, warnings };
     };
 
     // ── Freeform: line_replace ────────────────────────────────────
@@ -208,7 +228,7 @@ export class BatchEditService {
         FreeformEditor.assertLine(source, op.startLine, op.expectLine);
       }
       const newContent = FreeformEditor.lineReplace(
-        source, op.startLine, op.endLine, op.content,
+        source, op.startLine, op.endLine, op.content ?? "",
       );
       return withChanged(newContent, `line_replace lines ${op.startLine}-${op.endLine}`);
     }
@@ -227,29 +247,17 @@ export class BatchEditService {
         );
       }
       const newContent = FreeformEditor.stringReplace(
-        source, op.searchText, op.content, op.replaceAll ?? false,
+        source, op.searchText, op.content ?? "", op.replaceAll ?? false,
       );
       return withChanged(newContent, "string_replace");
     }
 
     // ── Frontmatter ──────────────────────────────────────────────
     if (op.operation === "frontmatter_set") {
-      const data = parseFrontmatterPayload(op.content);
-      const rawFrontmatter = extractFrontmatterRaw(source);
-      let existing: Record<string, unknown> = {};
-      if (rawFrontmatter !== undefined) {
-        try {
-          const loaded = yaml.load(rawFrontmatter);
-          if (typeof loaded === "object" && loaded !== null) {
-            existing = loaded as Record<string, unknown>;
-          }
-        } catch (err) {
-          throw new InvalidFrontmatterYamlError(op.path, err);
-        }
-      }
-      const merged = Object.assign({}, existing, data);
-      const newContent = replaceFrontmatterBlock(source, yaml.dump(merged).trimEnd());
-      return withChanged(newContent, "frontmatter_set");
+      const data = op.frontmatter ?? parseFrontmatterPayload(op.content as string);
+      const merge = mergeFrontmatterPreservingStyle(source, data);
+      warnings.push(...merge.warnings);
+      return withChanged(merge.content, "frontmatter_set");
     }
 
     // ── Operacje AST (append / prepend / replace / delete) ──────────
@@ -259,23 +267,9 @@ export class BatchEditService {
     if (op.blockId) {
       target = { blockId: op.blockId };
     } else if (op.heading) {
-      const depth = op.headingDepth ?? 2;
-      const allHeadings = AstNavigator.findAllHeadings(tree);
-      const candidates = allHeadings
-        .filter((h) => h.depth === depth)
-        .map((h) => h.title);
-      if (candidates.length > 0) {
-        const exactMatches = AstNavigator.findAllMatchingHeadings(tree, op.heading, depth);
-        if (exactMatches.length > 1) {
-          throw new AmbiguousHeadingTargetError(op.heading, depth, exactMatches);
-        }
-        const matched = FuzzyMatcher.bestMatch(op.heading, candidates, 0.6);
-        target = matched
-          ? { heading: matched.match, depth }
-          : { heading: op.heading, depth };
-      } else {
-        target = { heading: op.heading, depth };
-      }
+      const resolution = HeadingResolver.resolve(tree, op.heading, op.headingDepth);
+      target = { heading: resolution.title, depth: resolution.depth };
+      if (resolution.warning !== undefined) warnings.push(resolution.warning);
     } else {
       target = "document";
     }
@@ -286,10 +280,13 @@ export class BatchEditService {
       content: op.content ?? "",
       replaceMode: op.replaceMode,
     };
-    // Heading/block edits preserve the rest of the file byte-for-byte.
-    let newContent = target === "document"
-      ? undefined
-      : TextPatcher.apply(source, tree, patchRequest, this.pipeline);
+    // Byte-preserving by default; `normalize: true` re-serializes via remark.
+    let newContent: string | undefined;
+    if (!(op.normalize ?? false)) {
+      newContent = target === "document"
+        ? TextPatcher.applyDocument(source, patchRequest)
+        : TextPatcher.apply(source, tree, patchRequest);
+    }
     if (newContent === undefined) {
       AstPatcher.apply(tree, patchRequest, this.pipeline);
       newContent = this.pipeline.stringify(tree);

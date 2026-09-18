@@ -3,6 +3,7 @@ import type {
   IVectorStore,
 } from "../domain/interfaces/index.js";
 import { TfIdfScorer } from "./scoring.js";
+import { isIgnoredPath } from "./vault-ignore.js";
 import type { Chunk } from "./chunker.js";
 
 export interface HybridSearchResult {
@@ -25,6 +26,12 @@ export interface HybridSearchOptions {
   vectorWeight?: number;
   /** Optional directory prefix to scope the search. */
   directory?: string | undefined;
+  /**
+   * Ignore globs (from `VAULT_IGNORE` / `.vaultignore`). Service directories
+   * are excluded unconditionally — a persisted index built by an older
+   * version may still hold `.stversions`/`.trash` entries.
+   */
+  ignorePatterns?: readonly string[] | undefined;
 }
 
 const DEFAULTS = {
@@ -56,7 +63,11 @@ export class HybridSearcher {
     const queryVector = await this.embedder.embed(query);
     let vectorResults = await this.store.search(queryVector, candidateK);
 
-    // 1b. Post-filter by directory prefix if provided
+    // 1b. Post-filter ignored paths (service directories) and, if provided,
+    // the directory prefix.
+    vectorResults = vectorResults.filter(
+      (r) => !isIgnoredPath(r.docPath, opts.ignorePatterns ?? []),
+    );
     if (opts.directory) {
       const prefix = opts.directory;
       vectorResults = vectorResults.filter((r) =>

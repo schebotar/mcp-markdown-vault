@@ -216,6 +216,7 @@ The server selects an embedding provider automatically:
 | `VAULT_PATH` | `/vault` | Markdown vault directory |
 | `VAULT_CONTEXT_MODE` | `assisted` | Vault orientation mode: `assisted` (host LLM/agent calls `prepare_overview` to gather evidence, then generates prose and calls `save_overview`) or `manual` (you author `meta/overview.md` yourself and the server does not overwrite it). `auto` is a deprecated alias for `assisted`. |
 | `VAULT_CONTEXT` | *(deprecated)* | Deprecated and ignored. Use `VAULT_CONTEXT_MODE` instead. |
+| `VAULT_IGNORE` | *(unset)* | CSV of extra glob patterns excluded from note listings, search and the vector index, e.g. `Archive/**,drafts/**`. Dot-prefixed path segments (`.obsidian`, `.trash`, `.stversions`, `.stfolder`, `.markdown_vault_mcp`) and `node_modules` are always excluded, and a `.vaultignore` file in the vault root (one pattern per line, `#` comments) is merged in. `vault list` and `view.glob` accept `includeHidden: true` as an escape hatch. |
 | `MCP_TRANSPORT_TYPE` | `stdio` | `stdio` (single client) or `sse` (multi-client HTTP) |
 | `PORT` | `3000` | HTTP port (SSE mode only) |
 | `OLLAMA_URL` | *(unset)* | Set to enable Ollama embeddings |

@@ -252,3 +252,46 @@ describe("HybridSearcher", () => {
     });
   });
 });
+
+// ── Service directories never surface in semantic search (P0-3) ────
+
+describe("HybridSearcher — ignored paths (P0-3)", () => {
+  const entries: VectorEntry[] = [
+    {
+      docPath: "Встречи/2026-09-15.md",
+      chunks: [{ chunkId: "root", vector: [0.9, 0.1, 0, 0], text: "recipe cooking ingredients", headingPath: [] }],
+    },
+    {
+      docPath: ".stversions/Встречи/2026-09-15~20260915-143824.md",
+      chunks: [{ chunkId: "root", vector: [0.9, 0.1, 0, 0], text: "recipe cooking ingredients", headingPath: [] }],
+    },
+    {
+      docPath: ".trash/deleted.md",
+      chunks: [{ chunkId: "root", vector: [0.9, 0.1, 0, 0], text: "recipe cooking ingredients", headingPath: [] }],
+    },
+  ];
+
+  it("filters stale service-directory entries out of the result set", async () => {
+    const store = new InMemoryVectorStore();
+    for (const entry of entries) await store.upsert(entry);
+
+    const searcher = new HybridSearcher(store, new ConceptEmbedder());
+    const results = await searcher.search("recipe cooking", { k: 10 });
+
+    expect(results.length).toBeGreaterThan(0);
+    expect(results.every((r) => r.docPath === "Встречи/2026-09-15.md")).toBe(true);
+  });
+
+  it("also honours extra ignore patterns", async () => {
+    const store = new InMemoryVectorStore();
+    for (const entry of entries) await store.upsert(entry);
+
+    const searcher = new HybridSearcher(store, new ConceptEmbedder());
+    const results = await searcher.search("recipe cooking", {
+      k: 10,
+      ignorePatterns: ["Встречи/**"],
+    });
+
+    expect(results).toEqual([]);
+  });
+});
