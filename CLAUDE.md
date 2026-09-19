@@ -15,7 +15,7 @@ npm install
 # Build (compiles to dist/, excludes test files)
 npm run build
 
-# Run all tests (806 tests across 61 files)
+# Run all tests (879 tests across 63 files)
 npm test
 
 # Run a single test file
@@ -49,6 +49,7 @@ Entry point: `src/index.ts` — composition root, reads env vars, wires dependen
 - **Heading Targeting** (`heading-target.ts`): resolves `heading` + optional `headingDepth`, tolerating a wrong depth — a unique match at another depth applies with a warning and `resolvedDepth`, several matches list every candidate with its depth, and a total miss throws `HEADING_NOT_FOUND` with `suggestions`
 - **Vault Ignore** (`vault-ignore.ts`): single source of truth for which paths are notes — dot-prefixed segments (`.obsidian`, `.trash`, `.stversions`, …), `node_modules`, plus `VAULT_IGNORE` (CSV) and `.vaultignore` globs. Applied once in `LocalFileSystemAdapter.listNotes`, so listings, search, the vector index, the overview and `vault stats` all agree; `includeHidden: true` is the escape hatch
 - **Directory Outline** (`directory-outline.ts`): builds the subdirectory tree with direct/recursive file counts used by `view.outline` (summary mode) and `vault list mode=tree`
+- **Portable Paths** (`portable-path.ts`): cross-platform (Windows-safe) name rules — reserved characters `<>:"|?*`, control characters, trailing dot/space, device names `CON`/`PRN`/`AUX`/`NUL`/`COM1-9`/`LPT1-9`, >255 chars, plus an optional ASCII-only mode. Enforced by `LocalFileSystemAdapter` on **creation only** (the note file plus directory segments that do not exist yet), so reading/editing/searching an already non-portable note keeps working; `NonPortablePathError` (`NON_PORTABLE_PATH`) carries every violation. Policy comes from `VAULT_PATH_POLICY` (`error` by default, `warn`, `off`, with a `:strict-ascii` suffix). `audit-names.ts` + `vault action="audit_names"` list existing offenders read-only
 - **Fragment Retrieval** (`chunker.ts`, `scoring.ts`, `fragment-retrieval.ts`): heading-aware markdown chunking with TF-IDF + word proximity scoring
 - **Semantic Search** (`hybrid-search.ts`, `vault-indexer.ts`): hybrid search combining vector similarity with lexical TF-IDF; background auto-vectorization via chokidar file watcher with debounce; supports optional directory scoping via post-filter
 - **Embedding Strategy** (`index.ts`): auto-selects provider — local `TransformersEmbeddingProvider` (zero-setup) or `OllamaEmbeddingProvider` when `OLLAMA_URL` is set and reachable
@@ -63,7 +64,7 @@ Entry point: `src/index.ts` — composition root, reads env vars, wires dependen
 - **Dry-Run Edit** (`dry-run-edit.ts`): coordinates edit preview vs commit — when `dryRun=true`, returns unified diff via `IDiffService` without writing; when false, writes to disk
 - **Bulk Read** (`bulk-read.ts`): reads multiple files/heading-scoped sections concurrently in a single call with per-item fault tolerance — reuses `IFileSystemAdapter` and `ReadByHeadingUseCase`
 - **Templating** (`create-from-template.ts`, `regex-template-engine.ts`): creates new notes from template files with `{{variable}}` placeholder injection via `ITemplateEngine`; refuses to overwrite existing destination files (`NoteAlreadyExistsError`)
-- **5 MCP Tools**: vault (CRUD + update + delete `pruneEmptyDirs` + list with `limit`/`mode=tree`/`includeHidden` + create_from_template), edit (byte-preserving AST patching + freeform line_replace/string_replace + `frontmatter` object or legacy JSON `frontmatter_set` + `normalize` opt-in + dryRun diff preview + returnContent + batch), view (fragment retrieval + global_search + semantic_search + outline summary/files + read by heading + glob with exclude/sort/limit + frontmatter_get + bulk_read + backlinks); `view.outline` and `vault list` support `directory` scoping and always report `totalFiles`/`truncated`
+- **5 MCP Tools**: vault (CRUD + update + delete `pruneEmptyDirs` + list with `limit`/`mode=tree`/`includeHidden` + create_from_template + `audit_names` for existing non-portable names), edit (byte-preserving AST patching + freeform line_replace/string_replace + `frontmatter` object or legacy JSON `frontmatter_set` + `normalize` opt-in + dryRun diff preview + returnContent + batch), view (fragment retrieval + global_search + semantic_search + outline summary/files + read by heading + glob with exclude/sort/limit + frontmatter_get + bulk_read + backlinks); `view.outline` and `vault list` support `directory` scoping and always report `totalFiles`/`truncated`
 
 ### Security
 
@@ -77,6 +78,7 @@ All file operations route through `SafePath` value object — prevents path trav
 | `VAULT_CONTEXT_MODE` | `assisted` | Vault orientation mode: `assisted` (host LLM/agent calls `prepare_overview`, writes prose, then calls `save_overview`) or `manual` (user authors `meta/overview.md`). `auto` is a deprecated alias for `assisted`. |
 | `VAULT_CONTEXT` | *(deprecated)* | Deprecated — ignored. Use `VAULT_CONTEXT_MODE` instead. |
 | `VAULT_IGNORE` | *(unset)* | CSV of extra glob patterns excluded from note listings, search and the vector index (e.g. `Archive/**,drafts/**`). Dot-prefixed path segments and `node_modules` are always excluded; `.vaultignore` in the vault root is merged in. `vault list` / `view.glob` accept `includeHidden: true`. |
+| `VAULT_PATH_POLICY` | `error` | Windows-safe name guard for **newly created** notes/directories: `error` rejects Windows-illegal names (reserved characters, control chars, trailing dot/space, `CON`/`PRN`/`AUX`/`NUL`/`COM1-9`/`LPT1-9`, >255 chars), `warn` logs only, `off` disables. `:strict-ascii` suffix also rejects non-ASCII names. Existing notes, reads, edits and overwrites are never blocked. |
 | `MCP_TRANSPORT_TYPE` | `stdio` | Transport: `stdio` (single client) or `sse` (multi-client HTTP) |
 | `PORT` | `3000` | HTTP port (SSE mode only) |
 | `OLLAMA_URL` | *(unset)* | Set to enable Ollama embeddings; if unset, local embeddings are used |

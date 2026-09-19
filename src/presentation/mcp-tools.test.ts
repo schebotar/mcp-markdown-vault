@@ -301,6 +301,80 @@ describe("vault tool", () => {
     expect(parsed.hints.currentState).toBeDefined();
     expect(parsed.hints.nextActions.length).toBeGreaterThan(0);
   });
+
+  it("refuses to create a note whose name Windows cannot store", async () => {
+    const result = await client.callTool({
+      name: "vault",
+      arguments: {
+        action: "create",
+        path: "Встречи/12:30.md",
+        content: "# Meeting\n",
+      },
+    });
+
+    expect(result.isError).toBe(true);
+    const content = result.content as Array<{ type: string; text: string }>;
+    const parsed = JSON.parse(content[0]!.text);
+    expect(parsed.error).toBe("NON_PORTABLE_PATH");
+    expect(parsed.violations[0].code).toBe("RESERVED_CHARACTER");
+    expect(parsed.violations[0].segment).toBe("12:30.md");
+    expect(parsed.hint).toContain("VAULT_PATH_POLICY=off");
+
+    // Nothing was created on disk.
+    await expect(fs.access(path.join(tmpDir, "Встречи"))).rejects.toThrow();
+  });
+
+  it("creates a portable note with Cyrillic and spaces in the name", async () => {
+    const result = await client.callTool({
+      name: "vault",
+      arguments: {
+        action: "create",
+        path: "Встречи/2026-09-15 Планёрка.md",
+        content: "# Планёрка\n",
+      },
+    });
+
+    expect(result.isError).toBeUndefined();
+    const fileContent = await fs.readFile(
+      path.join(tmpDir, "Встречи/2026-09-15 Планёрка.md"),
+      "utf-8",
+    );
+    expect(fileContent).toContain("Планёрка");
+  });
+
+  it("reports existing non-portable names without touching them", async () => {
+    await fs.writeFile(path.join(tmpDir, "legacy 12:30.md"), "# Old\n");
+
+    const result = await client.callTool({
+      name: "vault",
+      arguments: { action: "audit_names" },
+    });
+
+    const content = result.content as Array<{ type: string; text: string }>;
+    const audit = JSON.parse(content[0]!.text).result;
+    expect(audit.nonPortableCount).toBe(1);
+    expect(audit.notes[0].path).toBe("legacy 12:30.md");
+    expect(audit.notes[0].violations[0].code).toBe("RESERVED_CHARACTER");
+
+    // The file is still there and still readable.
+    const read = await client.callTool({
+      name: "vault",
+      arguments: { action: "read", path: "legacy 12:30.md" },
+    });
+    expect(read.isError).toBeUndefined();
+  });
+
+  it("audit_names reports nothing for a clean vault", async () => {
+    const result = await client.callTool({
+      name: "vault",
+      arguments: { action: "audit_names" },
+    });
+
+    const content = result.content as Array<{ type: string; text: string }>;
+    const audit = JSON.parse(content[0]!.text).result;
+    expect(audit.nonPortableCount).toBe(0);
+    expect(audit.scannedFiles).toBeGreaterThan(0);
+  });
 });
 
 // ── view tool ─────────────────────────────────────────────────────

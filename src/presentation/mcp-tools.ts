@@ -22,6 +22,7 @@ import { GetFrontmatterUseCase, parseFrontmatterPayload } from "../use-cases/fro
 import { UpdateFileUseCase } from "../use-cases/update-file.js";
 import { DryRunEditor } from "../use-cases/dry-run-edit.js";
 import { CreateFromTemplateUseCase } from "../use-cases/create-from-template.js";
+import { AuditNamesUseCase } from "../use-cases/audit-names.js";
 import { BatchEditService, type EditOperation } from "../use-cases/batch-edit.js";
 import { VaultOverviewService } from "../use-cases/vault-overview.js";
 import { BacklinkIndexService } from "../use-cases/backlink-index.js";
@@ -29,7 +30,7 @@ import { VaultIndexer } from "../use-cases/vault-indexer.js";
 import { MarkdownFileRepository } from "../infrastructure/markdown-file-repository.js";
 import { RegexTemplateEngine } from "../infrastructure/regex-template-engine.js";
 import { UnifiedDiffService } from "../infrastructure/diff-service.js";
-import { DomainError, InvalidArgumentError, OutlineLimitExceededError, AmbiguousHeadingTargetError, HeadingNotFoundError, PathIsDirectoryError, FreeformEditError, NoteNotFoundError } from "../domain/errors/index.js";
+import { DomainError, InvalidArgumentError, OutlineLimitExceededError, AmbiguousHeadingTargetError, HeadingNotFoundError, PathIsDirectoryError, FreeformEditError, NoteNotFoundError, NonPortablePathError } from "../domain/errors/index.js";
 import { OverviewManager } from "../use-cases/overview-manager.js";
 import { VaultStatsComposer } from "../use-cases/vault-stats.js";
 import { VaultOverviewResourceComposer } from "../use-cases/vault-resource-overview.js";
@@ -123,13 +124,13 @@ export function createMcpServer(deps: McpDependencies): McpServer {
   server.registerTool("vault", {
     title: "Vault",
     description:
-      `Manage vault notes. Vault scope: ${vaultScope}. Actions: list (browse notes), read (full note), create/update/delete (whole-file writes), stat (metadata), create_from_template (scaffold from template). For search strategy and conventions, read vault://overview.`,
+      `Manage vault notes. Vault scope: ${vaultScope}. Actions: list (browse notes), read (full note), create/update/delete (whole-file writes), stat (metadata), create_from_template (scaffold from template), audit_names (report existing non-Windows-portable file names). For search strategy and conventions, read vault://overview.`,
     inputSchema: {
-      action: z.enum(["list", "read", "create", "update", "delete", "stat", "create_from_template"]),
+      action: z.enum(["list", "read", "create", "update", "delete", "stat", "create_from_template", "audit_names"]),
       path: z.string().optional(),
       directory: z.string().optional(),
       content: z.string().optional(),
-      limit: z.number().optional().describe("For list: maximum number of paths to return (default 100)."),
+      limit: z.number().optional().describe("For list: maximum number of paths to return (default 100). For audit_names: maximum offending notes to list (default 100)."),
       offset: z.number().optional().describe("For list: number of paths to skip."),
       mode: z.enum(["flat", "tree"]).optional().describe("For list: 'flat' (default) returns paths up to limit; 'tree' returns a subdirectory summary with file counts (like vault overview)."),
       maxDepth: z.number().optional().describe("For list mode='tree': maximum directory depth to expand (default 3)."),
@@ -137,8 +138,9 @@ export function createMcpServer(deps: McpDependencies): McpServer {
       pruneEmptyDirs: z.boolean().optional().describe("For delete: also remove parent directories that became empty."),
       templatePath: z.string().optional().describe("Source template file path (for create_from_template)."),
       variables: z.record(z.string(), z.string()).optional().describe("Key-value variables to inject into template placeholders (for create_from_template)."),
+      charset: z.enum(["unicode", "strict-ascii"]).optional().describe("For audit_names: 'unicode' (default) flags only Windows-illegal names; 'strict-ascii' also flags non-ASCII (Cyrillic, emoji) names."),
     },
-  }, async ({ action, path, directory, content, limit, offset, mode, maxDepth, includeHidden, pruneEmptyDirs, templatePath, variables }) => {
+  }, async ({ action, path, directory, content, limit, offset, mode, maxDepth, includeHidden, pruneEmptyDirs, templatePath, variables, charset }) => {
     return wrapTool(deps.workflow, "vault", takePrimingContext(), async () => {
       switch (action) {
         case "list": {
@@ -232,6 +234,16 @@ export function createMcpServer(deps: McpDependencies): McpServer {
           deps.backlinkIndex?.updateFile(path, created);
           deps.indexer?.indexFile(path).catch(() => {/* background */});
           return result.message;
+        }
+        case "audit_names": {
+          // Creation is guarded, but a vault filled before the guard existed
+          // can still hold names Windows refuses — those never sync.
+          const useCase = new AuditNamesUseCase(deps.fsAdapter);
+          return useCase.execute({
+            directory,
+            charset,
+            limit,
+          });
         }
         default:
           throw new InvalidArgumentError("action");
@@ -1094,6 +1106,9 @@ async function wrapTool<T>(
       if (err instanceof HeadingNotFoundError) {
         errorResponse["suggestions"] = err.suggestions;
         errorResponse["candidates"] = err.candidates;
+      }
+      if (err instanceof NonPortablePathError) {
+        errorResponse["violations"] = err.violations;
       }
       return {
         content: [{ type: "text", text: JSON.stringify(errorResponse) }],

@@ -75,7 +75,7 @@
 
 | Tool | Actions | Description |
 |---|---|---|
-| 📁 **vault** | `list` `read` `create` `update` `delete` `stat` `create_from_template` | Full CRUD for vault notes + template scaffolding |
+| 📁 **vault** | `list` `read` `create` `update` `delete` `stat` `create_from_template` `audit_names` | Full CRUD for vault notes + template scaffolding + Windows-portability audit of existing names |
 | ✏️ **edit** | `append` `prepend` `replace` `delete` `line_replace` `string_replace` `frontmatter_set` + `operations[]` batch mode | AST-based patching + freeform fallback + frontmatter update + batch edit (supports `dryRun` diff preview) |
 | 👁️ **view** | `search` `global_search` `semantic_search` `outline` `read` `frontmatter_get` `bulk_read` `backlinks` | Fragment retrieval, cross-vault search, hybrid semantic search, read by heading, frontmatter read, bulk read, backlinks |
 | 🔄 **workflow** | `status` `transition` `history` `reset` | Petri net state machine control |
@@ -93,6 +93,12 @@
 - **AST vs Freeform**: Always prefer AST operations (`append`, `prepend`, `replace`, `delete`) as they are structural. Use `string_replace` only as a last resort; it requires exact literal matches including whitespace and newlines.
 - **`replaceMode`**: `replace` defaults to `body` (preserves the heading, replaces content). Set `replaceMode: "section"` to replace the heading node and all its child headings.
 - **`returnContent`**: Set to `section` or `file` to see the results of your edit immediately in the tool response (max 8KB).
+
+### 📁 Cross-Platform Names (Windows Sync)
+- **Why**: a vault is usually synced to a Windows machine, and Windows refuses names Linux accepts — such a note silently fails to sync or lands as a conflict.
+- **Guard**: creating a note or directory with a Windows-illegal name (`< > : " | ? *`, control characters, trailing dot/space, `CON`/`PRN`/`AUX`/`NUL`/`COM1-9`/`LPT1-9`, >255 chars) fails with `NON_PORTABLE_PATH` and lists every offending segment. Tune it with `VAULT_PATH_POLICY` (`error` | `warn` | `off`, optionally `:strict-ascii`).
+- **Existing notes are never blocked**: reads, edits, search and overwrites keep working, so a note that already has a bad name can be fixed. Run `vault action="audit_names"` (optionally with `directory` and `charset: "strict-ascii"`) to find the ones that slipped in earlier.
+- **Directories**: only names that the current write actually creates are checked — a note inside a pre-existing `legacy 12:30/` folder is still creatable.
 
 ### 🚀 Performance & Consistency
 - **`bulk_read`**: Use this to read 2 or more files/sections concurrently. It is significantly faster than multiple sequential `view.read` calls.
@@ -217,6 +223,7 @@ The server selects an embedding provider automatically:
 | `VAULT_CONTEXT_MODE` | `assisted` | Vault orientation mode: `assisted` (host LLM/agent calls `prepare_overview` to gather evidence, then generates prose and calls `save_overview`) or `manual` (you author `meta/overview.md` yourself and the server does not overwrite it). `auto` is a deprecated alias for `assisted`. |
 | `VAULT_CONTEXT` | *(deprecated)* | Deprecated and ignored. Use `VAULT_CONTEXT_MODE` instead. |
 | `VAULT_IGNORE` | *(unset)* | CSV of extra glob patterns excluded from note listings, search and the vector index, e.g. `Archive/**,drafts/**`. Dot-prefixed path segments (`.obsidian`, `.trash`, `.stversions`, `.stfolder`, `.markdown_vault_mcp`) and `node_modules` are always excluded, and a `.vaultignore` file in the vault root (one pattern per line, `#` comments) is merged in. `vault list` and `view.glob` accept `includeHidden: true` as an escape hatch. |
+| `VAULT_PATH_POLICY` | `error` | Cross-platform (Windows-safe) name guard for **newly created** notes and directories. `error` rejects a name Windows cannot store (`< > : " \| ? *`, control characters, trailing dot/space, `CON`/`PRN`/`AUX`/`NUL`/`COM1-9`/`LPT1-9`, >255 chars) so the vault stays syncable to a Windows machine; `warn` creates the file but logs the problem; `off` disables the check. Add `:strict-ascii` (e.g. `error:strict-ascii`) to also reject non-ASCII names (Cyrillic, emoji) — the safest option for cross-platform sync. Existing notes, reads, edits and overwrites are never blocked; `vault action="audit_names"` reports names that already violate the rules. |
 | `MCP_TRANSPORT_TYPE` | `stdio` | `stdio` (single client) or `sse` (multi-client HTTP) |
 | `PORT` | `3000` | HTTP port (SSE mode only) |
 | `OLLAMA_URL` | *(unset)* | Set to enable Ollama embeddings |

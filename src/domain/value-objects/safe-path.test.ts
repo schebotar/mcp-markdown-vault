@@ -39,6 +39,29 @@ describe("SafePath", () => {
       expect(sp.relative).toBe("inbox/idea.md");
     });
 
+    it("strips a trailing space instead of appending .md after it", () => {
+      // Windows drops the trailing space, so "note.md " must mean "note.md" —
+      // never "note.md .md", which no platform could sync.
+      const sp = SafePath.create(VAULT_ROOT, "inbox/note.md ");
+      expect(sp.relative).toBe("inbox/note.md");
+    });
+
+    it("appends .md after stripping a trailing space from a bare name", () => {
+      const sp = SafePath.create(VAULT_ROOT, "inbox/note ");
+      expect(sp.relative).toBe("inbox/note.md");
+    });
+
+    it("strips a trailing dot from a bare name", () => {
+      const sp = SafePath.create(VAULT_ROOT, "inbox/note.");
+      expect(sp.relative).toBe("inbox/note.md");
+    });
+
+    it("rejects a path whose file name is nothing but dots and spaces", () => {
+      expect(() => SafePath.create(VAULT_ROOT, "inbox/ . ")).toThrow(
+        InvalidNotePathError,
+      );
+    });
+
     it("handles vault root with trailing slash", () => {
       const sp = SafePath.create("/vault/", "note.md");
       expect(sp.absolute).toBe("/vault/note.md");

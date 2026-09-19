@@ -1,3 +1,8 @@
+import {
+  describePortabilityViolations,
+  type PortabilityViolation,
+} from "../value-objects/portable-path.js";
+
 /**
  * Base class for all domain errors.
  * Carries a machine-readable `code` for programmatic handling
@@ -238,6 +243,32 @@ export class SymlinkEscapeError extends DomainError {
       `Symlink escapes vault boundary: ${resolvedPath}`,
     );
     this.name = "SymlinkEscapeError";
+  }
+}
+
+/**
+ * Thrown when creating a note would produce a name that cannot exist on
+ * Windows (and therefore cannot be synced to a Windows machine).
+ *
+ * Only creation is guarded — an already existing note with such a name stays
+ * readable and editable so it can be renamed or fixed.
+ */
+export class NonPortablePathError extends DomainError {
+  /** Every rule violation found, so the caller can report all of them at once. */
+  public readonly violations: ReadonlyArray<PortabilityViolation>;
+
+  constructor(notePath: string, violations: ReadonlyArray<PortabilityViolation>) {
+    const lines = describePortabilityViolations(violations);
+    super(
+      "NON_PORTABLE_PATH",
+      `Path is not portable to Windows: ${notePath}\n${lines.map((l) => `  - ${l}`).join("\n")}`,
+      undefined,
+      "Rename the note/directory (drop the reserved characters, trailing dots/spaces and " +
+        "device names CON/PRN/AUX/NUL/COM1-9/LPT1-9), or set VAULT_PATH_POLICY=off to " +
+        "disable the check. Read-only actions and updates of existing notes are never blocked.",
+    );
+    this.name = "NonPortablePathError";
+    this.violations = violations;
   }
 }
 

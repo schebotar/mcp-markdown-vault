@@ -37,6 +37,7 @@ import {
   parseVaultIgnoreEnv,
   parseVaultIgnoreFile,
 } from "./use-cases/vault-ignore.js";
+import { parsePortablePathPolicy } from "./domain/value-objects/index.js";
 
 export const DEFAULT_VAULT_SCOPE = "general markdown notes vault";
 
@@ -207,8 +208,16 @@ async function main(): Promise<void> {
   const allowReset = process.env["VECTOR_STORE_RESET"] === "true";
 
   const ignorePatterns = await loadIgnorePatterns(vaultRoot);
+  const portablePath = parsePortablePathPolicy(process.env["VAULT_PATH_POLICY"]);
+  if (portablePath.policy !== "error" || portablePath.charset !== "unicode") {
+    console.error(
+      `Portable path policy: ${portablePath.policy} (charset: ${portablePath.charset})`,
+    );
+  }
   const fsAdapter = await LocalFileSystemAdapter.create(vaultRoot, {
     ignorePatterns,
+    portablePathPolicy: portablePath.policy,
+    portablePathCharset: portablePath.charset,
   });
   const { getVaultScope } = await initializeVaultOrientation({
     fsAdapter,

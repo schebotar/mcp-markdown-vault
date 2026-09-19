@@ -33,7 +33,18 @@ export class SafePath {
       throw new InvalidNotePathError(notePath);
     }
 
-    const withExt = sanitized.endsWith(".md") ? sanitized : `${sanitized}.md`;
+    // Windows silently strips trailing dots and spaces from a file name, so
+    // "note.md " would become "note.md" on the synced machine. Strip them here
+    // too — otherwise the extension below would be appended to the space
+    // ("note.md .md") and the resulting name could never sync.
+    const trimmed = stripTrailingDotsAndSpaces(sanitized);
+
+    // The name became empty (e.g. "inbox/ . ") — there is nothing to create.
+    if (trimmed.length === 0 || trimmed.endsWith("/")) {
+      throw new InvalidNotePathError(notePath);
+    }
+
+    const withExt = trimmed.endsWith(".md") ? trimmed : `${trimmed}.md`;
     return SafePath.resolve(vaultRoot, withExt, notePath);
   }
 
@@ -128,4 +139,12 @@ function isAbsolutePath(p: string): boolean {
 function containsTraversal(p: string): boolean {
   const segments = p.split("/");
   return segments.some((seg) => seg === "..");
+}
+
+/** Drop trailing dots and spaces from a path's last segment (Windows does this silently). */
+function stripTrailingDotsAndSpaces(p: string): string {
+  const lastSlash = p.lastIndexOf("/");
+  const dir = p.slice(0, lastSlash + 1);
+  const name = p.slice(lastSlash + 1).replace(/[. ]+$/, "");
+  return dir + name;
 }

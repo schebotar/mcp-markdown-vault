@@ -13,8 +13,19 @@ import {
   NoteAlreadyExistsError,
   SymlinkEscapeError,
   PathIsDirectoryError,
+  NonPortablePathError,
 } from "../domain/errors/index.js";
 import { SafePath } from "../domain/value-objects/index.js";
+import {
+  DEFAULT_PORTABLE_PATH_CHARSET,
+  DEFAULT_PORTABLE_PATH_POLICY,
+  findSegmentViolations,
+} from "../domain/value-objects/index.js";
+import type {
+  PortabilityViolation,
+  PortablePathCharset,
+  PortablePathPolicy,
+} from "../domain/value-objects/index.js";
 import { isIgnoredPath } from "../use-cases/vault-ignore.js";
 
 /** Construction options for {@link LocalFileSystemAdapter}. */
@@ -24,21 +35,45 @@ export interface LocalFileSystemAdapterOptions {
    * (from `VAULT_IGNORE` and `.vaultignore`).
    */
   ignorePatterns?: readonly string[];
+
+  /**
+   * Enforcement level for cross-platform (Windows-safe) names — see
+   * `portable-path.ts`. `"error"` (default) rejects creating a note or
+   * directory whose name Windows cannot store, so the vault stays syncable to
+   * a Windows machine; `"warn"` only reports; `"off"` disables the check.
+   *
+   * Only creation is affected: reading, editing, searching and overwriting an
+   * existing note is never blocked, so an already non-portable note can still
+   * be opened and renamed.
+   */
+  portablePathPolicy?: PortablePathPolicy;
+
+  /**
+   * Name charset. `"unicode"` (default) allows Cyrillic and other non-ASCII
+   * names; `"strict-ascii"` rejects them as well.
+   */
+  portablePathCharset?: PortablePathCharset;
 }
 
 export class LocalFileSystemAdapter implements IFileSystemAdapter {
   private readonly vaultRoot: string;
   private readonly canonicalRoot: string;
   private readonly ignorePatterns: readonly string[];
+  private readonly portablePathPolicy: PortablePathPolicy;
+  private readonly portablePathCharset: PortablePathCharset;
 
   private constructor(
     vaultRoot: string,
     canonicalRoot: string,
     ignorePatterns: readonly string[],
+    portablePathPolicy: PortablePathPolicy,
+    portablePathCharset: PortablePathCharset,
   ) {
     this.vaultRoot = vaultRoot;
     this.canonicalRoot = canonicalRoot;
     this.ignorePatterns = ignorePatterns;
+    this.portablePathPolicy = portablePathPolicy;
+    this.portablePathCharset = portablePathCharset;
   }
 
   static async create(
@@ -60,6 +95,8 @@ export class LocalFileSystemAdapter implements IFileSystemAdapter {
       resolved,
       canonicalRoot,
       options?.ignorePatterns ?? [],
+      options?.portablePathPolicy ?? DEFAULT_PORTABLE_PATH_POLICY,
+      options?.portablePathCharset ?? DEFAULT_PORTABLE_PATH_CHARSET,
     );
   }
 
@@ -188,15 +225,23 @@ export class LocalFileSystemAdapter implements IFileSystemAdapter {
     const safePath = SafePath.create(this.vaultRoot, notePath);
     await this.assertContained(safePath.absolute);
 
+    // Portability guard — creation only. An existing note is never blocked:
+    // a name that is already non-portable must stay readable/editable (and
+    // overwritable) so it can be fixed or renamed.
+    let fileExists = true;
+    try {
+      await fs.access(safePath.absolute);
+    } catch {
+      fileExists = false;
+    }
+
+    if (!fileExists && this.portablePathPolicy !== "off") {
+      await this.assertCreationNamesPortable(notePath, safePath.absolute);
+    }
+
     // Check for existing file when overwrite is not enabled
-    if (!overwrite) {
-      try {
-        await fs.access(safePath.absolute);
-        throw new NoteAlreadyExistsError(notePath);
-      } catch (err) {
-        if (err instanceof NoteAlreadyExistsError) throw err;
-        // File doesn't exist — proceed
-      }
+    if (!overwrite && fileExists) {
+      throw new NoteAlreadyExistsError(notePath);
     }
 
     // Ensure parent directory exists
@@ -219,6 +264,69 @@ export class LocalFileSystemAdapter implements IFileSystemAdapter {
       }
       throw err;
     }
+  }
+
+  /**
+   * Validate every name this write is about to create: the note file name plus
+   * the directory segments that do not exist yet.
+   *
+   * Two exemptions, both deliberate:
+   *
+   * - Segments that ALREADY exist on disk are skipped. A folder like
+   *   `legacy 12:30/` created before the guard (or by another machine) must not
+   *   prevent new, perfectly portable notes from being created inside it, and
+   *   an existing non-portable note must stay readable/editable — otherwise the
+   *   guard would lock the user out of their own vault. Those names are
+   *   reported by `vault action="audit_names"` instead.
+   * - Content inside an existing service directory (`.obsidian/templates/…`,
+   *   `.trash/…`) is not synced note content, so it is left alone.
+   */
+  private async assertCreationNamesPortable(
+    notePath: string,
+    absoluteFilePath: string,
+  ): Promise<void> {
+    const toValidate: string[] = [path.basename(absoluteFilePath)];
+    let current = path.dirname(absoluteFilePath);
+
+    while (current.startsWith(this.vaultRoot + path.sep)) {
+      let isExistingDir = false;
+      try {
+        isExistingDir = (await fs.stat(current)).isDirectory();
+      } catch {
+        // Not created yet — this write will create it.
+      }
+
+      if (isExistingDir) {
+        // Stop at the first existing ancestor. If it is a dot-prefixed service
+        // directory, everything below it is service content and the segments
+        // collected so far are fine to leave unchecked.
+        if (path.basename(current).startsWith(".")) return;
+        break;
+      }
+
+      toValidate.unshift(path.basename(current));
+      current = path.dirname(current);
+    }
+
+    const violations = toValidate.flatMap((segment) =>
+      findSegmentViolations(segment, { charset: this.portablePathCharset }),
+    );
+    if (violations.length > 0) {
+      this.handleViolations(notePath, violations);
+    }
+  }
+
+  private handleViolations(
+    notePath: string,
+    violations: readonly PortabilityViolation[],
+  ): void {
+    if (this.portablePathPolicy === "error") {
+      throw new NonPortablePathError(notePath, violations);
+    }
+    console.error(
+      `[portable-path] ${notePath} is not Windows-portable: ` +
+        violations.map((v) => `${v.segment} (${v.code})`).join(", "),
+    );
   }
 
   async deleteNote(

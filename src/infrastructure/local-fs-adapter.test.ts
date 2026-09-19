@@ -10,6 +10,7 @@ import {
   VaultNotFoundError,
   SymlinkEscapeError,
   PathIsDirectoryError,
+  NonPortablePathError,
 } from "../domain/errors/index.js";
 
 let vaultDir: string;
@@ -370,5 +371,176 @@ describe("LocalFileSystemAdapter — symlink containment", () => {
       await fs.unlink(symlinkVault);
       await fs.rm(realVault, { recursive: true, force: true });
     }
+  });
+});
+
+// ── Portable (Windows-safe) name guard ─────────────────────────────
+
+describe("LocalFileSystemAdapter portable path guard", () => {
+  const exists = async (relPath: string): Promise<boolean> => {
+    try {
+      await fs.access(path.join(vaultDir, relPath));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  it("allows ordinary names, including Cyrillic and spaces", async () => {
+    await adapter.writeNote("Встречи/2026-09-15 Заметка.md", "ok");
+
+    expect(await exists("Встречи/2026-09-15 Заметка.md")).toBe(true);
+  });
+
+  it("rejects a Windows-reserved character in the file name", async () => {
+    await expect(adapter.writeNote("Встречи/12:30.md", "x")).rejects.toThrow(
+      NonPortablePathError,
+    );
+
+    expect(await exists("Встречи/12:30.md")).toBe(false);
+    expect(await exists("Встречи")).toBe(false);
+  });
+
+  it("reports the offending segment and code on the error", async () => {
+    const error = await adapter
+      .writeNote("daily/a?b.md", "x")
+      .catch((err: unknown) => err as NonPortablePathError);
+
+    expect(error).toBeInstanceOf(NonPortablePathError);
+    expect((error as NonPortablePathError).code).toBe("NON_PORTABLE_PATH");
+    expect((error as NonPortablePathError).violations).toHaveLength(1);
+    expect((error as NonPortablePathError).violations[0]?.segment).toBe("a?b.md");
+    expect((error as NonPortablePathError).violations[0]?.code).toBe("RESERVED_CHARACTER");
+    expect((error as NonPortablePathError).hint).toContain("VAULT_PATH_POLICY=off");
+  });
+
+  it("rejects a reserved device name and a non-portable directory segment", async () => {
+    await expect(adapter.writeNote("aux.md", "x")).rejects.toThrow(NonPortablePathError);
+    await expect(adapter.writeNote("nul", "x")).rejects.toThrow(NonPortablePathError);
+    await expect(adapter.writeNote("tmp/12:30.md", "x")).rejects.toThrow(
+      NonPortablePathError,
+    );
+  });
+
+  it("normalizes a trailing space the way Windows would (instead of creating 'note.md .md')", async () => {
+    await adapter.writeNote("note.md ", "ok");
+
+    expect(await exists("note.md")).toBe(true);
+  });
+
+  it("allows a space or dot directly before the extension (Windows keeps it)", async () => {
+    await adapter.writeNote("note .md", "ok");
+
+    expect(await exists("note .md")).toBe(true);
+  });
+
+  it("rejects a reserved character in a directory segment that would be created", async () => {
+    await expect(
+      adapter.writeNote("Встречи/12:30/note.md", "x"),
+    ).rejects.toThrow(NonPortablePathError);
+
+    expect(await exists("Встречи/12:30")).toBe(false);
+  });
+
+  it("does not block a new note under a directory that already exists with a non-portable name", async () => {
+    // Folder created outside the server (or before the guard) — the new note
+    // itself is perfectly portable, so it must still be creatable.
+    await fs.mkdir(path.join(vaultDir, "legacy 12:30"), { recursive: true });
+
+    await adapter.writeNote("legacy 12:30/new-note.md", "ok");
+
+    expect(await exists("legacy 12:30/new-note.md")).toBe(true);
+  });
+
+  it("keeps an existing non-portable note readable, updatable and overwritable", async () => {
+    await fs.writeFile(path.join(vaultDir, "старое 12:30.md"), "old");
+
+    expect(await adapter.readNote("старое 12:30.md")).toBe("old");
+
+    await adapter.writeNote("старое 12:30.md", "new", true);
+    expect(await adapter.readNote("старое 12:30.md")).toBe("new");
+  });
+
+  it("still raises NoteAlreadyExistsError for an existing portable note", async () => {
+    await adapter.writeNote("note.md", "one");
+
+    await expect(adapter.writeNote("note.md", "two")).rejects.toThrow(
+      NoteAlreadyExistsError,
+    );
+  });
+
+  it("still raises NoteAlreadyExistsError for an existing non-portable note", async () => {
+    await fs.writeFile(path.join(vaultDir, "old:name.md"), "one");
+
+    await expect(adapter.writeNote("old:name.md", "two")).rejects.toThrow(
+      NoteAlreadyExistsError,
+    );
+  });
+
+  it("skips the guard entirely when the policy is off", async () => {
+    const permissive = await LocalFileSystemAdapter.create(vaultDir, {
+      portablePathPolicy: "off",
+    });
+
+    await permissive.writeNote("Встречи/12:30/note.md", "ok");
+
+    expect(await exists("Встречи/12:30/note.md")).toBe(true);
+  });
+
+  it("creates the note but reports the violation when the policy is warn", async () => {
+    const warnAdapter = await LocalFileSystemAdapter.create(vaultDir, {
+      portablePathPolicy: "warn",
+    });
+
+    await warnAdapter.writeNote("Встречи/12:30.md", "ok");
+
+    expect(await exists("Встречи/12:30.md")).toBe(true);
+  });
+
+  it("rejects non-ASCII names only under the strict-ascii charset", async () => {
+    const strict = await LocalFileSystemAdapter.create(vaultDir, {
+      portablePathCharset: "strict-ascii",
+    });
+
+    await expect(strict.writeNote("Встречи/note.md", "x")).rejects.toThrow(
+      NonPortablePathError,
+    );
+    await strict.writeNote("meetings/note.md", "ok");
+
+    expect(await exists("meetings/note.md")).toBe(true);
+  });
+
+  it("rejects names longer than the 255-character component limit", async () => {
+    await expect(
+      adapter.writeNote(`${"a".repeat(253)}.md`, "x"),
+    ).rejects.toThrow(NonPortablePathError);
+  });
+
+  it("does not block service directories (dot-prefixed) with template tooling", async () => {
+    await adapter.writeNote(".obsidian/templates/daily note.md", "tpl");
+
+    expect(await exists(".obsidian/templates/daily note.md")).toBe(true);
+  });
+
+  it("checks the file name when the note sits at the vault root", async () => {
+    await expect(adapter.writeNote("12:30.md", "x")).rejects.toThrow(NonPortablePathError);
+    await expect(adapter.writeNote("nul", "x")).rejects.toThrow(NonPortablePathError);
+
+    await adapter.writeNote("ok-12-30.md", "x");
+    expect(await exists("ok-12-30.md")).toBe(true);
+  });
+
+  it("rejects a non-portable directory that would be created above a service directory", async () => {
+    await expect(adapter.writeNote("a?b/.hidden/x.md", "x")).rejects.toThrow(
+      NonPortablePathError,
+    );
+
+    expect(await exists("a?b")).toBe(false);
+  });
+
+  it("still allows creating a portable directory several levels deep", async () => {
+    await adapter.writeNote("2026/09/15/Заметка.md", "ok");
+
+    expect(await exists("2026/09/15/Заметка.md")).toBe(true);
   });
 });
